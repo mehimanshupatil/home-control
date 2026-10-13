@@ -86,7 +86,8 @@ Flat JSON with the same keys (`ps`, `acmd`, `actmp`, `rmtmp`, `acfs`, …, `onli
 Supported when the device model lists the `udpControl` config capability.
 
 - One-time key fetch (needs cloud once): `GET {API}deviceManagement/devices/deviceId/{deviceId}`
-  → `[{ "macAddress", "ipAddress", "udpControlKey": "<hex>", "udpcontrolIV": "<hex>", ... }]`.
+  → `[{ "macAddress", "ipAddress", "udpControlKey": "<hex>", "udpControlIV": "<hex>", "udpControlKeyTs", "multicastIP", ... }]`.
+  The server spells the IV `udpControlIV`; the decompiled app reads `udpcontrolIV` (so it never gets the IV). Accept both.
   Store key/IV/MAC; afterwards no Panasonic server is needed.
 - Transport: UDP port **5001** both ways (app binds local 5001 to receive).
 - Crypto: AES-CBC/NoPadding, key & IV from hex; plaintext zero-padded to 16 bytes;
@@ -152,6 +153,7 @@ Observed from diagnostics on 2026-10-13:
 - **Timer (`actm`, ki 14):** the official app (`ACDetailsActivity` → `ACDevice.setOff/OnTimerInSeconds` → `TimerValueCapability.buildOff/OnTimerMessage`) sends **relative seconds** `[offSeconds, onSeconds]`, `-1` = unset, and keeps the other timer as its remaining seconds. The picker range is 10–1440 **minutes** in steps of 10. Status reports `actm` as **UTC epoch seconds** `[offUTC, onUTC]`, `-1` = unset.
 - Sleep profile `acsp`: status `"none"`; attributes `duration` 2–8 h and `temps` 16–30.
 - Real status keys: `ps acmd actmp acfs acvs achs acdc acem acec acpm bzr cnv actm acsp rmtmp`, plus `errors`, `warnings` (strings, empty = none), `filterDustLevel`, `filterCleaningRequired`, `filterCleaningCause`, `totalOperatingHours`, `rssi`, `onlineStatus` ("true"), `V` (firmware). Also `acng acngs acms acmss acfc acgm acpms acdl ldy`, which aren't in this model's control list.
+- **LAN test (2026-10-13, at home):** the cloud record has a 64-hex (AES-256) `udpControlKey`, a 32-hex `udpControlIV` and `multicastIP` `239.255.0.15`. The registered MAC is the Wi-Fi MAC + 1 (ESP32). `DISC_REQ_<MAC>` sent by unicast, broadcast and multicast, listening on port 5001 and the source port, got **no reply**. Conclusion: this firmware doesn't run the LAN protocol; control is cloud-only. The record also carries Matter pairing data (`manualCode`, `discriminator`, `qrcode`).
 - Temperature in status is a string with one decimal (`"26.0"`). The official app also **sends** it that way (`DecimalFormat("#.0")`).
 - When ECO is switched on, the official app also sets the temperature to 26° (`ACDevice`, `DEFAULT_AC_TEMPERATURE_FOR_ECOMODE`). Our apps don't do this yet.
 

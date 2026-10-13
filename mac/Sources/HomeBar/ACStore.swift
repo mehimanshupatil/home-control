@@ -291,7 +291,7 @@ final class ACStore: ObservableObject {
         guard let resp = try? await api.get("deviceManagement/devices/deviceId/\(deviceId)") else { return }
         let d = (resp as? [[String: Any]])?.first ?? (resp as? [String: Any])
         guard let d, let mac = d["macAddress"] as? String,
-              let key = d["udpControlKey"] as? String, let iv = d["udpcontrolIV"] as? String,
+              let key = d["udpControlKey"] as? String, let iv = (d["udpControlIV"] as? String) ?? (d["udpcontrolIV"] as? String), // server sends udpControlIV; the official app reads udpcontrolIV
               !key.isEmpty, !iv.isEmpty else { return }
         Keychain.save(LocalACInfo(mac: mac, ip: d["ipAddress"] as? String, key: key, iv: iv), account: "local-\(deviceId)")
     }
