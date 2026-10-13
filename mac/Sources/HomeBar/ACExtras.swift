@@ -142,7 +142,8 @@ struct ACInfoRow: View {
 
 // MARK: Timer
 
-/// "Turn off in…" (AC on) / "Turn on in…" (AC off) with presets, a custom stepper and active-timer pills.
+/// Turn-on / turn-off timer with presets, a custom stepper and active-timer pills. Both slots can be set;
+/// the picker defaults to "Turn off" while the AC runs and "Turn on" while it's off.
 struct ACTimerRow: View {
     @EnvironmentObject private var ac: ACStore
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -150,8 +151,10 @@ struct ACTimerRow: View {
 
     @ViewState private var customOpen = false
     @ViewState private var customMinutes = 90
+    /// User's choice; nil follows the power state.
+    @ViewState private var chosenSlot: ACStore.TimerSlot?
 
-    private var slot: ACStore.TimerSlot { device.state.power ? .off : .on }
+    private var slot: ACStore.TimerSlot { chosenSlot ?? (device.state.power ? .off : .on) }
     private var range: ACRange { device.timerRange ?? ACRange(min: 10, max: 1440, step: 10) }
     private var presets: [Int] { [30, 60, 120, 240, 480].filter { Double($0) >= range.min && Double($0) <= range.max } }
 
@@ -160,7 +163,15 @@ struct ACTimerRow: View {
             HStack(spacing: 8) {
                 Image(systemName: "timer").font(.caption).foregroundStyle(.secondary).frame(width: 16)
                     .accessibilityHidden(true)
-                Text(slot == .off ? "Turn off in" : "Turn on in").font(.caption).foregroundStyle(.secondary)
+                Picker("Timer type", selection: Binding(get: { slot }, set: { chosenSlot = $0 })) {
+                    Text("Turn on").tag(ACStore.TimerSlot.on)
+                    Text("Turn off").tag(ACStore.TimerSlot.off)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .controlSize(.small)
+                .fixedSize()
+                Text("in").font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 Menu {
                     ForEach(presets, id: \.self) { m in

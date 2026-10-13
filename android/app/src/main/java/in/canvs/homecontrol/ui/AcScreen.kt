@@ -288,7 +288,10 @@ private fun AcCard(ac: AcState, repo: AcRepository, profiles: List<AcProfile>) {
 
 private val TIMER_PRESETS = listOf(30 to "30 min", 60 to "1 h", 120 to "2 h", 240 to "4 h", 480 to "8 h")
 
-/** Off timer while the AC is on, on timer while it's off. Active timers show as pills with Cancel. */
+/**
+ * Turn-on / turn-off timer. Both slots can be set; the selector defaults to "Turn off" while the AC runs
+ * and "Turn on" while it's off. Active timers show as pills with Cancel.
+ */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun TimerRow(ac: AcState, repo: AcRepository) {
@@ -297,19 +300,20 @@ private fun TimerRow(ac: AcState, repo: AcRepository) {
     val now = System.currentTimeMillis() / 1000
     val (offUtc, onUtc) = TimerMath.parseStatus(ac.rawStatus[timer.key])
     var custom by remember { mutableStateOf(false) }
-    val offSlot = ac.power
+    // User's choice; resets to the power-based default when power changes.
+    var offSlot by remember(id, ac.power) { mutableStateOf(ac.power) }
     val presets = TIMER_PRESETS.filter { it.first in timer.minMinutes..timer.maxMinutes }
 
     Column(Modifier.fillMaxWidth().padding(top = 8.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Icon(Icons.Outlined.Timer, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(16.dp))
             Spacer(Modifier.width(6.dp))
-            Text(
-                if (offSlot) "Turn off in…" else "Turn on in…",
-                style = MaterialTheme.typography.labelMedium,
-                fontWeight = FontWeight.SemiBold,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp), modifier = Modifier.width(184.dp)) {
+                OptionTile("Turn on", selected = !offSlot, modifier = Modifier.weight(1f)) { offSlot = false }
+                OptionTile("Turn off", selected = offSlot, modifier = Modifier.weight(1f)) { offSlot = true }
+            }
+            Spacer(Modifier.width(6.dp))
+            Text("in…", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         Spacer(Modifier.height(4.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
