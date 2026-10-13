@@ -58,6 +58,7 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | How the apps are structured, data flow, storage, UI system |
 | [PROTOCOL.md](PROTOCOL.md) | MirAIe cloud + LAN protocol and WiZ UDP protocol, with the full AC capability table |
 | [docs/REVERSE_ENGINEERING.md](docs/REVERSE_ENGINEERING.md) | How the protocols were derived and how to re-verify against a new app version |
+| [docs/FEATURES.md](docs/FEATURES.md) | Every vendor-app feature vs ours: Have / Build / Later / Skip |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | What's next and which assumptions still need a real device |
 | [AGENTS.md](AGENTS.md) | Build, test and contribution rules for coding agents (and humans) |
 

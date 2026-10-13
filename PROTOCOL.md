@@ -151,6 +151,20 @@ Observed from diagnostics on 2026-10-13:
 - Temperature in status is a string with one decimal (`"26.0"`). The official app also **sends** it that way (`DecimalFormat("#.0")`).
 - When ECO is switched on, the official app also sets the temperature to 26° (`ACDevice`, `DEFAULT_AC_TEMPERATURE_FOR_ECOMODE`). Our apps don't do this yet.
 
+### 1.9 Energy consumption history (cloud only)
+
+`GET {API}powerConsumption/devices/{deviceId}?grain=<Daily|Weekly|Monthly>&startDate=<d>&endDate=<d>`
+(`IDeviceService.getPowerConsumption`, UI in `miraie/widgets/EnergyConsumption.java` and `devicedetails/ac/powerconsumption/DayHelper.java`).
+
+| grain | date format | window the official app requests |
+|---|---|---|
+| `Daily` | `ddMMyyyy` | 7 days (start + 6) |
+| `Weekly` | `ddMMyyyy` | 7 weeks (start of week 1 … start of week 7) |
+| `Monthly` | `MMyyyy` | a range of months |
+
+Response: `[{ "day" | "week" | "month": "<label>", "power": "<kWh as string>" }]`. The unit shown in the app is **kWh**.
+Days with no data may be missing; the app fills gaps with zero. The home-level `powerConsumption/homes/{homeId}` endpoint belongs to the third-party "Ohm" integration, not the AC.
+
 ---
 
 ## 2. WiZ (local LAN: UDP JSON-RPC)

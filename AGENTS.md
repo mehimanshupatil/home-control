@@ -29,7 +29,8 @@ Every change must build. UI changes should be checked visually (snapshots or emu
 3. **Secrets:** never log or copy the password, access/refresh tokens, or the full LAN key/IV. Diagnostics must stay redacted; the tests and self-checks above enforce this, so keep them passing.
 4. **Never commit** vendor APKs, `extracted/` (decompiled vendor code), build outputs, `local.properties`, or real diagnostics from a user's device.
 5. **Don't test on real devices without the owner:** no installs to physical phones, and no commands to real ACs or bulbs, unless the user asks.
-6. **Protocol changes:** update `PROTOCOL.md` first, then both apps. Mark anything not confirmed on a real device as *unverified*.
+6. **Feature inventory first:** before building in a feature area, check `docs/FEATURES.md`. If the vendor app has screens or APIs there that the file doesn't list, inventory the whole area from the decompiled app first (screens, APIs, device commands) and add every feature with a status. Never drop a vendor feature silently: mark it Build, Later or Skip, with a reason.
+7. **Protocol changes:** update `PROTOCOL.md` first, then both apps. Mark anything not confirmed on a real device as *unverified*.
 
 ## Gotchas
 - **No Xcode on the dev machine:** with Command Line Tools only, SwiftUI's `@State` macro plugin is missing. Use `@ViewState` (a typealias in `StateCompat.swift`) instead of `@State`. `@Environment`, `@AppStorage`, `@StateObject` and `@EnvironmentObject` work normally.
