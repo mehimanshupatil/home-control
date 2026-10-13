@@ -123,11 +123,29 @@ actor MirAIeAPI {
 
     /// Authenticated GET against the API base; retries once after renewing on 401.
     func get(_ path: String) async throws -> Any {
-        let url = Self.apiBase.appendingPathComponent(path)
+        guard let json = try await request("GET", path) else { throw MirAIeError.badResponse }
+        return json
+    }
+
+    /// Authenticated request against the API base (`path` relative to `/simplifi/v1/`). `body` is a
+    /// JSON object/array. Returns the decoded JSON, or nil for an empty response body (Completable
+    /// endpoints). Retries once after renewing the session on 401.
+    @discardableResult
+    func request(_ method: String, _ path: String, query: [String: String] = [:], body: Any? = nil) async throws -> Any? {
+        var comps = URLComponents(url: Self.apiBase.appendingPathComponent(path), resolvingAgainstBaseURL: false)!
+        if !query.isEmpty {
+            comps.queryItems = query.sorted { $0.key < $1.key }.map { URLQueryItem(name: $0.key, value: $0.value) }
+        }
+        guard let url = comps.url else { throw MirAIeError.badResponse }
         for attempt in 0..<2 {
             var req = URLRequest(url: url)
+            req.httpMethod = method
             req.setValue("Bearer \(try await validAccessToken())", forHTTPHeaderField: "Authorization")
             req.setValue("application/json", forHTTPHeaderField: "Accept")
+            if let body {
+                req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                req.httpBody = try JSONSerialization.data(withJSONObject: body)
+            }
             let (data, resp) = try await session.data(for: req)
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
             if code == 401 && attempt == 0 {
@@ -137,7 +155,8 @@ actor MirAIeAPI {
             guard (200..<300).contains(code) else {
                 throw MirAIeError.http(code, String(decoding: data, as: UTF8.self))
             }
-            return try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+            if data.isEmpty { return nil }
+            return try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
         }
         throw MirAIeError.badResponse
     }

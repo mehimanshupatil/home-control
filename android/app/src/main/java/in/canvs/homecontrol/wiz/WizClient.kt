@@ -68,12 +68,22 @@ class WizClient(context: Context) {
     }
 
     /** Sends `setPilot` to one bulb with up to 3 attempts; returns true on `success`. */
-    suspend fun setPilot(ip: String, params: JSONObject): Boolean = withContext(Dispatchers.IO) {
-        val msg = JSONObject().put("id", 1).put("method", "setPilot").put("params", params).toString().toByteArray()
+    suspend fun setPilot(ip: String, params: JSONObject): Boolean = call(ip, "setPilot", params)
+
+    /**
+     * `pulse` (`PulseParam`: `delta`, `duration`): a short brightness dip, the WiZ app's identify.
+     * Returns false when the bulb doesn't confirm (callers fall back to a setPilot blink).
+     */
+    suspend fun pulse(ip: String, delta: Int = -60, durationMs: Int = 800): Boolean =
+        call(ip, "pulse", JSONObject().put("delta", delta).put("duration", durationMs), attempts = 1, timeoutMs = 1000)
+
+    /** One JSON-RPC call; true when the reply carries `result.success`. */
+    suspend fun call(ip: String, method: String, params: JSONObject, attempts: Int = 3, timeoutMs: Int = 700): Boolean = withContext(Dispatchers.IO) {
+        val msg = JSONObject().put("id", 1).put("method", method).put("params", params).toString().toByteArray()
         val addr = InetAddress.getByName(ip)
         DatagramSocket().use { socket ->
-            socket.soTimeout = 700
-            repeat(3) {
+            socket.soTimeout = timeoutMs
+            repeat(attempts) {
                 runCatching {
                     socket.send(DatagramPacket(msg, msg.size, addr, PORT))
                     val buf = ByteArray(1024)
@@ -126,6 +136,8 @@ class WizClient(context: Context) {
             20 to "Spring", 21 to "Summer", 22 to "Fall", 23 to "Deep dive", 24 to "Jungle",
             25 to "Mojito", 26 to "Club", 27 to "Christmas", 28 to "Halloween", 29 to "Candlelight",
             30 to "Golden white", 31 to "Pulse", 32 to "Steampunk",
+            // From the WiZ app's bundled light-mode library (ids 33 and 35).
+            33 to "Diwali", 35 to "Alarm",
         )
 
         /**
@@ -135,7 +147,7 @@ class WizClient(context: Context) {
         val SCENE_GROUPS: List<Pair<String, List<Int>>> = listOf(
             "White" to listOf(11, 12, 13, 30, 14, 15, 16, 17, 18, 19, 9, 10),
             "Colors" to listOf(1, 2, 3, 5, 6, 7, 8, 20, 21, 22, 23, 24, 25, 29),
-            "Moving" to listOf(4, 26, 31, 32, 27, 28),
+            "Moving" to listOf(4, 26, 31, 32, 27, 28, 33, 35),
         )
 
         fun sceneName(id: Int): String? = SCENES.firstOrNull { it.first == id }?.second

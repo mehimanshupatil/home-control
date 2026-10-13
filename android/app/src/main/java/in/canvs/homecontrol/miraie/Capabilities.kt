@@ -4,7 +4,12 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /** How a model capability is presented and sent. */
-enum class CapKind { Toggle, Choice, IntChoice, Status }
+enum class CapKind {
+    Toggle, Choice, IntChoice, Status,
+
+    /** One tile that steps through [CapabilitySpec.values] (nanoe GA: off → on → auto). */
+    Cycle,
+}
 
 /** One capability the AC's model lists, resolved to its wire key and allowed values. */
 data class CapabilitySpec(
@@ -40,6 +45,10 @@ object CapabilityCatalog {
         "EcoNavi" to Info(21, CapKind.Toggle, "ECONAVI"),
         "EconomySensor" to Info(27, CapKind.Toggle, "Economy sensor"),
         "BuzzerControl" to Info(30, CapKind.Toggle, "Beep"),
+        "Humidifier" to Info(258, CapKind.Toggle, "Humidifier"),
+        "LaundryMode" to Info(29, CapKind.Toggle, "Laundry"),
+        // nanoe GA is a SingleValue capability; the official app sends `{key: value}` without `ki`.
+        "NanoeGA" to Info(NO_KI, CapKind.Cycle, "nanoe GA"),
         "DisplayControl" to Info(8, CapKind.Choice, "Display"),
         "VerticalSwing" to Info(5, CapKind.IntChoice, "Vertical swing"),
         "HorizontalSwing" to Info(6, CapKind.IntChoice, "Horizontal swing"),
@@ -48,10 +57,15 @@ object CapabilityCatalog {
         "RoomHumidity" to Info(102, CapKind.Status, "Humidity"),
         "FilterDustLevel" to Info(15, CapKind.Status, "Filter"),
         "TimeBasedFilterHealth" to Info(25, CapKind.Status, "Filter health"),
+        "FilterCalibration" to Info(26, CapKind.Status, "Filter calibration"),
+        "SleepProfile" to Info(SleepProfile.KI, CapKind.Status, "Sleep profile"),
         "PM25Sensor" to Info(20, CapKind.Status, "PM2.5"),
         "CurrentPowerConsumption" to Info(104, CapKind.Status, "Power"),
         "ACFaults" to Info(107, CapKind.Status, "Faults"),
     )
+
+    /** Key index meaning "omit `ki` from the payload" (cloud). LAN always sends `ki: 1`. */
+    const val NO_KI = -1
 
     /** Convertible capacity (%) → payload int. Off sends 0. */
     val CONVERTIBLE_DEFAULT = listOf(40, 50, 55, 60, 70, 80, 90, 100, 110, 0)
@@ -92,6 +106,7 @@ object CapabilityCatalog {
         val ints = attr?.optJSONArray("intValues").ints().ifEmpty { attr?.optJSONObject("range")?.let(::expandRange).orEmpty() }
         return when (info.kind) {
             CapKind.Choice -> CapabilitySpec(name, key, info.ki, info.kind, info.label, values = strings.ifEmpty { listOf("on", "night", "off") })
+            CapKind.Cycle -> CapabilitySpec(name, key, info.ki, info.kind, info.label, values = strings.ifEmpty { listOf("off", "on", "auto") })
             CapKind.IntChoice -> {
                 val values = when (name) {
                     // Capacity values arrive as strings ("40") or ints; off is always offered.

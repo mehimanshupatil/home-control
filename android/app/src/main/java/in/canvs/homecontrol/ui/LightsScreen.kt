@@ -67,6 +67,18 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import `in`.canvs.homecontrol.wiz.Bulb
 import `in`.canvs.homecontrol.wiz.LightsRepository
 import `in`.canvs.homecontrol.wiz.WizClient
+import `in`.canvs.homecontrol.wiz.LightRoom
+import `in`.canvs.homecontrol.wiz.LightPreset
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.outlined.Bookmark
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
@@ -114,7 +126,22 @@ fun LightsScreen(repo: LightsRepository) {
                 ) { scope.launch { repo.discover() } }
             }
         }
-        items(state.bulbs, key = { it.mac }) { bulb -> BulbCard(bulb, repo) { renaming = bulb } }
+        if (state.presets.isNotEmpty()) item { PresetsRow(state.presets, repo) }
+        val roomed = state.rooms.flatMap { it.macs }.toSet()
+        state.rooms.forEach { room ->
+            val bulbs = state.bulbs.filter { it.mac in room.macs }
+            item(key = "room-${room.id}") { RoomCard(room, bulbs, repo) }
+            // Indented under their room so membership reads at a glance.
+            items(bulbs, key = { "${room.id}-${it.mac}" }) { bulb ->
+                Box(Modifier.padding(start = 16.dp)) { BulbCard(bulb, repo, state.rooms) { renaming = bulb } }
+            }
+        }
+        val others = state.bulbs.filter { it.mac !in roomed }
+        if (state.rooms.isNotEmpty() && others.isNotEmpty()) {
+            item(key = "others") { Label("Other lights", Modifier.padding(top = 4.dp)) }
+        }
+        items(others, key = { it.mac }) { bulb -> BulbCard(bulb, repo, state.rooms) { renaming = bulb } }
+        if (state.bulbs.isNotEmpty()) item(key = "add-room") { AddRoomButton(repo) }
     }
 
     renaming?.let { bulb ->
@@ -151,7 +178,7 @@ private fun QuickAction(title: String, icon: androidx.compose.ui.graphics.vector
 
 @OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 @Composable
-private fun BulbCard(bulb: Bulb, repo: LightsRepository, onRename: () -> Unit) {
+private fun BulbCard(bulb: Bulb, repo: LightsRepository, rooms: List<LightRoom>, onRename: () -> Unit) {
     val density = LocalDensity.current.density
     var expanded by rememberSaveable(bulb.mac) { mutableStateOf(false) }
     var dimming by remember(bulb.mac, bulb.dimming) { mutableFloatStateOf(bulb.dimming.toFloat()) }
@@ -296,8 +323,15 @@ private fun BulbCard(bulb: Bulb, repo: LightsRepository, onRename: () -> Unit) {
                         Text("Fast", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
+                if (rooms.isNotEmpty()) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Label("Room", Modifier.weight(1f))
+                        RoomMenu(rooms, rooms.firstOrNull { bulb.mac in it.macs }) { repo.assignBulb(bulb.mac, it?.id) }
+                    }
+                }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(bulb.ip, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline, modifier = Modifier.weight(1f))
+                    SavePresetButton(repo, listOf(bulb.mac), compact = true)
                     TextButton(onClick = { repo.identify(bulb.mac) }) { Text("Identify") }
                     TextButton(onClick = onRename) { Text("Rename") }
                 }
@@ -417,4 +451,218 @@ private fun statusText(bulb: Bulb): String {
         else -> null
     }
     return listOfNotNull("${bulb.dimming}%", detail).joinToString(" · ")
+}
+
+// ---- rooms and presets (local, this phone only) ---------------------------------------------------------
+
+@Composable
+private fun RoomCard(room: LightRoom, bulbs: List<Bulb>, repo: LightsRepository) {
+    val onCount = bulbs.count { it.on }
+    val anyOn = onCount > 0
+    var menu by remember { mutableStateOf(false) }
+    var renaming by remember { mutableStateOf(false) }
+    var deleting by remember { mutableStateOf(false) }
+    val avg = bulbs.filter { it.on }.map { it.dimming }.average().takeIf { !it.isNaN() } ?: 100.0
+    var dimming by remember(room.id, avg) { mutableFloatStateOf(avg.toFloat()) }
+    val tint = Color(0xFFFFCC00)
+
+    HomeCard(tint = if (anyOn) tint else null) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text(room.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, modifier = Modifier.semantics { heading() })
+                Text(
+                    if (bulbs.isEmpty()) "No lights yet — assign them from a light's options" else "$onCount of ${bulbs.size} on",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Box {
+                RoundIconButton(Icons.Filled.MoreVert, "Room options", size = 36.dp) { menu = true }
+                DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                    DropdownMenuItem(text = { Text("Rename room") }, onClick = { menu = false; renaming = true })
+                    DropdownMenuItem(text = { Text("Delete room") }, onClick = { menu = false; deleting = true })
+                }
+            }
+            if (bulbs.isNotEmpty()) PowerButton(anyOn, label = "${room.name} lights", tint = Color(0xFFFF9F0A)) { repo.setRoomOn(room.id, !anyOn) }
+        }
+        if (bulbs.isNotEmpty()) {
+            Row(Modifier.padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Outlined.WbSunny, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(16.dp))
+                Slider(
+                    value = dimming,
+                    onValueChange = { dimming = it },
+                    onValueChangeFinished = { repo.setRoomBrightness(room.id, dimming.roundToInt()) },
+                    valueRange = 10f..100f,
+                    colors = SliderDefaults.colors(
+                        thumbColor = Color(0xFFFF9F0A),
+                        activeTrackColor = Color(0xFFFF9F0A),
+                        inactiveTrackColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.1f),
+                        inactiveTickColor = Color.Transparent,
+                        activeTickColor = Color.Transparent,
+                    ),
+                    modifier = Modifier.weight(1f).padding(horizontal = 8.dp).semantics { contentDescription = "${room.name} brightness" },
+                )
+                Text("${dimming.roundToInt()}%", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.width(40.dp))
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Label("Scene", Modifier.weight(1f))
+                val common = bulbs.map { it.sceneId }.distinct().singleOrNull() ?: 0
+                SceneMenu(common) { repo.setRoomScene(room.id, it) }
+            }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                SavePresetButton(repo, bulbs.map { it.mac }, compact = false)
+            }
+        }
+    }
+    if (renaming) {
+        var name by remember { mutableStateOf(room.name) }
+        AlertDialog(
+            onDismissRequest = { renaming = false },
+            title = { Text("Rename room") },
+            text = { OutlinedTextField(name, { name = it.take(30) }, singleLine = true, label = { Text("Name") }) },
+            confirmButton = { TextButton(enabled = name.isNotBlank(), onClick = { repo.renameRoom(room.id, name); renaming = false }) { Text("Save") } },
+            dismissButton = { TextButton(onClick = { renaming = false }) { Text("Cancel") } },
+        )
+    }
+    if (deleting) {
+        AlertDialog(
+            onDismissRequest = { deleting = false },
+            title = { Text("Delete “${room.name}”?") },
+            text = { Text("The lights stay; they just move to Other lights. Rooms are stored on this phone only.") },
+            confirmButton = { TextButton(onClick = { repo.deleteRoom(room.id); deleting = false }) { Text("Delete") } },
+            dismissButton = { TextButton(onClick = { deleting = false }) { Text("Cancel") } },
+        )
+    }
+}
+
+@Composable
+private fun AddRoomButton(repo: LightsRepository) {
+    var naming by remember { mutableStateOf(false) }
+    var name by remember { mutableStateOf("") }
+    OutlinedButton(onClick = { name = ""; naming = true }, modifier = Modifier.fillMaxWidth().height(48.dp)) {
+        Icon(Icons.Filled.Add, null, modifier = Modifier.size(18.dp))
+        Spacer(Modifier.width(6.dp))
+        Text("Add room")
+    }
+    if (naming) {
+        AlertDialog(
+            onDismissRequest = { naming = false },
+            title = { Text("New room") },
+            text = {
+                Column {
+                    Text("Rooms are stored on this phone only.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(name, { name = it.take(30) }, singleLine = true, label = { Text("Name, e.g. Bedroom") })
+                }
+            },
+            confirmButton = { TextButton(enabled = name.isNotBlank(), onClick = { repo.createRoom(name); naming = false }) { Text("Create") } },
+            dismissButton = { TextButton(onClick = { naming = false }) { Text("Cancel") } },
+        )
+    }
+}
+
+@Composable
+private fun RoomMenu(rooms: List<LightRoom>, current: LightRoom?, onSelect: (LightRoom?) -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    Box {
+        Row(
+            Modifier
+                .height(40.dp)
+                .clip(RoundedCornerShape(10.dp))
+                .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.07f))
+                .pressable { open = true }
+                .padding(horizontal = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(current?.name ?: "None", style = MaterialTheme.typography.labelLarge)
+            Icon(Icons.Filled.KeyboardArrowDown, null, modifier = Modifier.size(18.dp))
+        }
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            DropdownMenuItem(
+                text = { Text("None") },
+                onClick = { onSelect(null); open = false },
+                trailingIcon = { if (current == null) Icon(Icons.Filled.Check, contentDescription = "Selected") },
+            )
+            rooms.forEach { r ->
+                DropdownMenuItem(
+                    text = { Text(r.name) },
+                    onClick = { onSelect(r); open = false },
+                    trailingIcon = { if (current?.id == r.id) Icon(Icons.Filled.Check, contentDescription = "Selected") },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SavePresetButton(repo: LightsRepository, macs: List<String>, compact: Boolean) {
+    var naming by remember { mutableStateOf(false) }
+    var name by remember { mutableStateOf("") }
+    TextButton(onClick = { name = ""; naming = true }) {
+        if (!compact) {
+            Icon(Icons.Outlined.Bookmark, null, modifier = Modifier.size(16.dp))
+            Spacer(Modifier.width(6.dp))
+        }
+        Text(if (compact) "Save preset" else "Save as preset")
+    }
+    if (naming) {
+        AlertDialog(
+            onDismissRequest = { naming = false },
+            title = { Text("Save preset") },
+            text = {
+                Column {
+                    Text(
+                        "Saves the current on/off, brightness, colour or scene of ${if (macs.size == 1) "this light" else "these ${macs.size} lights"}.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(name, { name = it.take(30) }, singleLine = true, label = { Text("Name, e.g. Movie") })
+                }
+            },
+            confirmButton = { TextButton(enabled = name.isNotBlank(), onClick = { repo.savePreset(name, macs); naming = false }) { Text("Save") } },
+            dismissButton = { TextButton(onClick = { naming = false }) { Text("Cancel") } },
+        )
+    }
+}
+
+/** Saved presets: tap to apply, long-press to delete. */
+@OptIn(ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
+@Composable
+private fun PresetsRow(presets: List<LightPreset>, repo: LightsRepository) {
+    val haptics = LocalHapticFeedback.current
+    var deleting by remember { mutableStateOf<LightPreset?>(null) }
+    Column {
+        Label("Presets")
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            presets.forEach { p ->
+                Row(
+                    Modifier
+                        .height(40.dp)
+                        .clip(RoundedCornerShape(Metrics.tileRadius))
+                        .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f))
+                        .combinedClickable(
+                            onClick = { repo.applyPreset(p) },
+                            onLongClick = { haptics.performHapticFeedback(HapticFeedbackType.LongPress); deleting = p },
+                            onLongClickLabel = "Delete preset",
+                        )
+                        .padding(horizontal = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(Icons.Outlined.Bookmark, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(14.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text(p.name, style = MaterialTheme.typography.labelLarge)
+                }
+            }
+        }
+    }
+    deleting?.let { p ->
+        AlertDialog(
+            onDismissRequest = { deleting = null },
+            title = { Text("Delete “${p.name}”?") },
+            text = { Text("This preset is removed from this phone only.") },
+            confirmButton = { TextButton(onClick = { repo.deletePreset(p.id); deleting = null }) { Text("Delete") } },
+            dismissButton = { TextButton(onClick = { deleting = null }) { Text("Cancel") } },
+        )
+    }
 }

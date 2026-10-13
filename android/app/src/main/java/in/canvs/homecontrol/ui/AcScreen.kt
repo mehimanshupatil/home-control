@@ -16,6 +16,10 @@ import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.semantics.stateDescription
 import `in`.canvs.homecontrol.miraie.CapKind
 import `in`.canvs.homecontrol.miraie.CapabilityCatalog
+import `in`.canvs.homecontrol.miraie.AirQuality
+import `in`.canvs.homecontrol.miraie.SleepProfile
+import androidx.compose.material.icons.outlined.Bedtime
+import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -140,6 +144,7 @@ fun AcScreen(
     onHideKeys: () -> Unit,
     showDiagnostics: Boolean,
     onHideDiagnostics: () -> Unit,
+    onOpen: (AcPage) -> Unit = {},
 ) {
     val state by repo.state.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
@@ -180,14 +185,22 @@ fun AcScreen(
                 ) { scope.launch { repo.refresh(forceCloud = true) } }
             }
         }
-        items(state.devices, key = { it.device.deviceId }) { ac -> AcCard(ac, repo, state.profiles[ac.device.deviceId].orEmpty()) }
+        items(state.devices, key = { it.device.deviceId }) { ac ->
+            AcCard(ac, repo, state.profiles[ac.device.deviceId].orEmpty(), state.sleepProfiles[ac.device.deviceId], onOpen)
+        }
         if (showDiagnostics) item { DiagnosticsCard(repo, state.devices, onHideDiagnostics) }
         if (showKeys) item { KeysCard(repo, state.devices, onHideKeys) }
     }
 }
 
 @Composable
-private fun AcCard(ac: AcState, repo: AcRepository, profiles: List<AcProfile>) {
+private fun AcCard(
+    ac: AcState,
+    repo: AcRepository,
+    profiles: List<AcProfile>,
+    sleepProfiles: List<SleepProfile>?,
+    onOpen: (AcPage) -> Unit,
+) {
     val id = ac.device.deviceId
     val tint = ModeStyle.tint(ac.mode)
     HomeCard(tint = if (ac.power) tint else null) {
@@ -280,6 +293,7 @@ private fun AcCard(ac: AcState, repo: AcRepository, profiles: List<AcProfile>) {
 
         TimerRow(ac, repo)
         ProfilesRow(ac, repo, profiles)
+        PagesRow(ac, sleepProfiles, onOpen)
         MoreSection(ac, repo, tint)
     }
 }
@@ -487,7 +501,9 @@ private fun InfoRow(ac: AcState) {
             val text = ac.statusOf(spec)?.toString()?.trim() ?: return@forEach
             when (spec.name) {
                 "RoomHumidity" -> add(Chip(Icons.Outlined.WaterDrop, "${num(text)}% humidity"))
-                "PM25Sensor" -> add(Chip(Icons.Outlined.Grain, "PM2.5 ${num(text)}"))
+                "PM25Sensor" -> text.toDoubleOrNull()?.toInt()?.let { pm -> AirQuality.band(pm) }?.let { band ->
+                    add(Chip(Icons.Outlined.Grain, "PM2.5 ${num(text)} · ${band.label}", aqiColor(band)))
+                }
                 "CurrentPowerConsumption" -> add(Chip(Icons.Outlined.Bolt, "${num(text)} W"))
             }
         }
@@ -526,10 +542,36 @@ private fun InfoRow(ac: AcState) {
     }
 }
 
+private fun aqiColor(band: AirQuality.Band): Color = when (band) {
+    AirQuality.Band.Excellent -> Color(0xFF34C759)
+    AirQuality.Band.Good -> Color(0xFF30B0C7)
+    AirQuality.Band.Moderate -> Color(0xFFFFCC00)
+    AirQuality.Band.Poor -> Color(0xFFFF9500)
+    AirQuality.Band.Unhealthy -> Color(0xFFFF3B30)
+    AirQuality.Band.Hazardous -> Color(0xFFAF52DE)
+}
+
 private fun isFault(text: String): Boolean =
     text.isNotEmpty() && text !in setOf("0", "[]", "{}", "none", "None", "null", "0.0")
 
 private fun num(text: String): String = text.toDoubleOrNull()?.let { fmt(it) } ?: text
+
+/** Entry tiles for Energy, Sleep and Settings pages. Cloud-backed ones carry a cloud mark. */
+@Composable
+private fun PagesRow(ac: AcState, sleepProfiles: List<SleepProfile>?, onOpen: (AcPage) -> Unit) {
+    val id = ac.device.deviceId
+    val running = sleepProfiles?.firstOrNull { it.isActive(ac.rawStatus[SleepProfile.KEY]?.toString()) }
+    val hasSleep = ac.spec("SleepProfile") != null
+    Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+        NavTile("Energy", Icons.Outlined.Bolt, "kWh history", cloud = true, modifier = Modifier.weight(1f)) { onOpen(AcPage.Energy(id)) }
+        if (hasSleep) {
+            NavTile("Sleep", Icons.Outlined.Bedtime, running?.let { "${it.displayName} on" } ?: "Profiles", cloud = true, modifier = Modifier.weight(1f)) {
+                onOpen(AcPage.Sleep(id))
+            }
+        }
+        NavTile("Settings", Icons.Outlined.Tune, "Filter, name", cloud = false, modifier = Modifier.weight(1f)) { onOpen(AcPage.Settings(id)) }
+    }
+}
 
 /** Extra controls the model lists; collapsed by default. */
 @Composable
@@ -576,19 +618,22 @@ private fun MoreSection(ac: AcState, repo: AcRepository, tint: Color) {
                 return@Column
             }
             val id = ac.device.deviceId
-            val toggles = controls.filter { it.kind == CapKind.Toggle }
+            val toggles = controls.filter { it.kind == CapKind.Toggle || it.kind == CapKind.Cycle }
             if (toggles.isNotEmpty()) {
                 toggles.chunked(3).forEach { row ->
                     Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                         row.forEach { spec ->
-                            val on = ac.statusOf(spec)?.toString().equals("on", ignoreCase = true)
+                            val value = ac.statusOf(spec)?.toString()?.lowercase()
+                            val on = value != null && value != "off" && (spec.kind == CapKind.Cycle || value == "on")
                             OptionTile(
-                                title = spec.label,
+                                title = if (spec.kind == CapKind.Cycle) "${spec.label}: ${CapabilityCatalog.choiceLabel(value ?: "off")}" else spec.label,
                                 selected = on,
                                 tint = tint,
                                 muted = !ac.power,
-                                modifier = Modifier.weight(1f).semantics { stateDescription = if (on) "On" else "Off" },
-                            ) { repo.sendRaw(id, spec.key, if (on) "off" else "on", spec.ki) }
+                                modifier = Modifier.weight(1f).semantics { stateDescription = CapabilityCatalog.choiceLabel(value ?: "off") },
+                            ) {
+                                if (spec.kind == CapKind.Cycle) repo.cycle(id, spec) else repo.setToggle(id, spec, !on)
+                            }
                         }
                         repeat(3 - row.size) { Spacer(Modifier.weight(1f)) }
                     }

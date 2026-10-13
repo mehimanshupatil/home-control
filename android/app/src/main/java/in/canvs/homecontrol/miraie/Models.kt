@@ -29,9 +29,11 @@ data class MiraieDevice(
     val homeId: String,
     /** Room ("space") name from the MirAIe home. */
     val space: String = "",
+    /** Room ("space") id; needed for sleep profiles, rename and move (cloud). */
+    val spaceId: String = "",
 )
 
-data class Home(val homeId: String, val name: String, val devices: List<MiraieDevice>)
+data class Home(val homeId: String, val name: String, val devices: List<MiraieDevice>, val spaces: List<Space> = emptyList())
 
 /** Per-device secrets for LAN control, fetched once from `deviceManagement/devices/deviceId/{id}`. */
 data class LocalKeys(

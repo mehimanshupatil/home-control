@@ -8,6 +8,7 @@ struct ACCapability: Identifiable, Equatable {
         case choice([String])          // string values (DisplayControl)
         case intChoice([IntOption])    // ints sent as numbers (swing, convertible, gen mode)
         case status                    // read-only
+        case cycle([String])           // single value stepped in order on each tap (nanoeGA off → on → auto)
         case core                      // power/mode/temperature/fan: handled by the main card
         case other                     // known to the model but not rendered here
     }
@@ -34,6 +35,7 @@ struct ACCapability: Identifiable, Equatable {
         case .toggle: "on | off"
         case .choice(let v): v.joined(separator: " | ")
         case .intChoice(let o): o.map { "\($0.value)=\($0.label)" }.joined(separator: " ")
+        case .cycle(let v): v.joined(separator: " → ")
         case .status, .core, .other: declaredValues.isEmpty ? "—" : declaredValues.joined(separator: " | ")
         }
     }
@@ -44,6 +46,7 @@ struct ACCapability: Identifiable, Equatable {
         case .choice: "choice"
         case .intChoice: "int-choice"
         case .status: "status"
+        case .cycle: "cycle"
         case .core: "core"
         case .other: "other"
         }
@@ -59,7 +62,7 @@ struct ACCapability: Identifiable, Equatable {
 
     static let toggleNames: [String] = [
         "PowerfulMode", "ECOMode", "EvaporatorClean", "NanoeG", "NanoeX", "JetStream", "TurboMode",
-        "Ionizer", "MotionSensor", "EcoNavi", "EconomySensor", "BuzzerControl",
+        "Ionizer", "MotionSensor", "EcoNavi", "EconomySensor", "Humidifier", "LaundryMode", "BuzzerControl",
     ]
 
     static let statusNames: [String] = [
@@ -89,6 +92,10 @@ struct ACCapability: Identifiable, Equatable {
         "PM25Sensor": Info(ki: 20, label: "PM2.5", symbol: "aqi.low"),
         "EcoNavi": Info(ki: 21, label: "ECONAVI", symbol: "eye"),
         "NanoeX": Info(ki: 23, label: "nanoe X", symbol: "aqi.high"),
+        "NanoeGA": Info(ki: 24, label: "nanoe GA", symbol: "aqi.medium"),
+        "FilterCalibration": Info(ki: 26, label: "Filter reset", symbol: "arrow.counterclockwise"),
+        "LaundryMode": Info(ki: 29, label: "Laundry", symbol: "tshirt"),
+        "Humidifier": Info(ki: 258, label: "Humidifier", symbol: "humidifier"),
         "TimeBasedFilterHealth": Info(ki: 25, label: "Filter health", symbol: "line.3.horizontal.decrease"),
         "EconomySensor": Info(ki: 27, label: "Economy sensor", symbol: "sensor"),
         "Convertible": Info(ki: 28, label: "Convertible", symbol: "gauge.with.dots.needle.67percent"),
@@ -133,6 +140,8 @@ struct ACCapability: Identifiable, Equatable {
             kind = .toggle
         case "DisplayControl":
             kind = .choice(strings.isEmpty ? ["on", "night", "off"] : strings)
+        case "NanoeGA":
+            kind = .cycle(["off", "on", "auto"])
         case "VerticalSwing", "HorizontalSwing":
             kind = .intChoice(swingOptions(name: name, ints: ints, range: attr?["range"]))
         case "Convertible":

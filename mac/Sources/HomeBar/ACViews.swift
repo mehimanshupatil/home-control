@@ -30,6 +30,7 @@ struct ACSection: View {
     @EnvironmentObject private var ac: ACStore
     @AppStorage("showACKeys") private var showACKeys = false
     @AppStorage("showACDiagnostics") private var showDiagnostics = false
+    @AppStorage("showACNotifications") private var showNotifications = false
 
     var body: some View {
         if !ac.loggedIn {
@@ -62,6 +63,10 @@ struct ACSection: View {
 
                 if showACKeys {
                     ACKeysCard { showACKeys = false }
+                }
+
+                if showNotifications {
+                    ACNotificationsCard { showNotifications = false }
                 }
 
                 if showDiagnostics {
@@ -121,6 +126,12 @@ struct ACCard: View {
     #else
     @ViewState private var showMore = false
     #endif
+    #if DEBUG
+    nonisolated(unsafe) static var debugPanel: ACPanel?
+    @ViewState private var panel: ACPanel? = ACCard.debugPanel
+    #else
+    @ViewState private var panel: ACPanel?
+    #endif
 
     private var state: ACState { device.state }
     private var tint: Color { ACModeStyle.tint(state.mode) }
@@ -130,6 +141,7 @@ struct ACCard: View {
             header
             temperatureRow
             ACInfoRow(device: device)
+            ACSleepStatus(device: device)
             controls
             if device.timerRange != nil {
                 ACTimerRow(device: device)
@@ -140,6 +152,11 @@ struct ACCard: View {
             moreToggle
             if showMore {
                 ACMoreControls(device: device, tint: tint)
+                    .transition(.reveal(reduceMotion: reduceMotion))
+            }
+            ACPanelBar(device: device, selection: $panel)
+            if let panel {
+                ACPanelView(device: device, panel: panel)
                     .transition(.reveal(reduceMotion: reduceMotion))
             }
         }

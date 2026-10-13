@@ -26,6 +26,8 @@ import androidx.compose.material.icons.filled.Lightbulb
 import androidx.compose.material.icons.outlined.AcUnit
 import androidx.compose.material.icons.outlined.Lightbulb
 import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material.icons.outlined.Cloud
+import androidx.activity.compose.BackHandler
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
@@ -61,12 +63,20 @@ fun HomeControlRoot(ac: AcRepository, lights: LightsRepository) {
         var tab by rememberSaveable { mutableIntStateOf(0) }
         var showKeys by rememberSaveable { mutableStateOf(false) }
         var showDiagnostics by rememberSaveable { mutableStateOf(false) }
+        var pageKey by rememberSaveable { mutableStateOf<String?>(null) }
+        val page = AcPage.decode(pageKey)
+        BackHandler(enabled = page != null) { pageKey = null }
         Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.surface) {
+            if (page != null) {
+                Box(Modifier.fillMaxSize().safeDrawingPadding()) { AcPageHost(page, ac) { pageKey = null } }
+                return@Surface
+            }
             Column(Modifier.fillMaxSize().safeDrawingPadding()) {
                 Header(
                     ac, lights,
                     showKeys = showKeys, onToggleKeys = { showKeys = !showKeys; tab = 0 },
                     showDiagnostics = showDiagnostics, onToggleDiagnostics = { showDiagnostics = !showDiagnostics; tab = 0 },
+                    onOpenNotifications = { pageKey = AcPage.Notifications.encode() },
                 )
                 TabSwitcher(tab) { tab = it }
                 Spacer(Modifier.height(Metrics.sectionSpacing))
@@ -76,6 +86,7 @@ fun HomeControlRoot(ac: AcRepository, lights: LightsRepository) {
                             ac,
                             showKeys = showKeys, onHideKeys = { showKeys = false },
                             showDiagnostics = showDiagnostics, onHideDiagnostics = { showDiagnostics = false },
+                            onOpen = { pageKey = it.encode() },
                         )
                         else -> LightsScreen(lights)
                     }
@@ -93,6 +104,7 @@ private fun Header(
     onToggleKeys: () -> Unit,
     showDiagnostics: Boolean,
     onToggleDiagnostics: () -> Unit,
+    onOpenNotifications: () -> Unit,
 ) {
     val acState by ac.state.collectAsStateWithLifecycle()
     val lightState by lights.state.collectAsStateWithLifecycle()
@@ -122,6 +134,11 @@ private fun Header(
             DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                 if (acState.loggedIn) {
                     CheckItem("AC: Local network only", acState.localOnly) { ac.setLocalOnly(!acState.localOnly) }
+                    DropdownMenuItem(
+                        text = { Text(if (acState.unreadAlerts > 0) "AC notifications (${acState.unreadAlerts})" else "AC notifications") },
+                        trailingIcon = { Icon(Icons.Outlined.Cloud, contentDescription = "Uses the MirAIe cloud", modifier = Modifier.size(16.dp)) },
+                        onClick = { menuOpen = false; onOpenNotifications() },
+                    )
                     CheckItem("Show AC keys", showKeys) { onToggleKeys(); menuOpen = false }
                     CheckItem("AC diagnostics", showDiagnostics) { onToggleDiagnostics(); menuOpen = false }
                     CheckItem("Try local control (experimental)", acState.experimentalLocal) {

@@ -36,6 +36,8 @@ struct ACDevice: Identifiable, Codable {
     var name: String
     var space: String
     let homeId: String
+    /// MirAIe room ("space") id; needed for rename, move and sleep-profile endpoints.
+    var spaceId: String?
     let topic: String
     var modelId: String?
     var keys = ACKeys()
@@ -49,7 +51,7 @@ struct ACDevice: Identifiable, Codable {
     /// Capabilities this AC's model declares (empty when the model is unknown).
     var capabilities: [ACCapability] { ACCapability.parse(model: model) }
 
-    enum CodingKeys: String, CodingKey { case id, name, space, homeId, topic, modelId, keys, udpCapable, model }
+    enum CodingKeys: String, CodingKey { case id, name, space, homeId, spaceId, topic, modelId, keys, udpCapable, model }
 }
 
 @MainActor
@@ -58,7 +60,7 @@ final class ACStore: ObservableObject {
     nonisolated static let fanSpeeds = ["auto", "quiet", "low", "medium", "high"]
 
     @Published private(set) var loggedIn = false
-    @Published private(set) var devices: [ACDevice] = []
+    @Published var devices: [ACDevice] = []
     @Published private(set) var loading = false
     @Published private(set) var mqttConnected = false
     @Published var errorMessage: String?
@@ -81,14 +83,30 @@ final class ACStore: ObservableObject {
     @Published private(set) var lastLocalDiscovery: [String: String] = [:]
     /// Saved local profiles per AC id.
     @Published private(set) var profiles: [String: [ACProfile]] = [:]
+    /// True when a MirAIe session exists (cloud-only features need it, see `cloudBlocker`).
+    @Published private(set) var cloudSignedIn = false
+    /// Rooms per home id, from the last cloud reload (for "Move to room").
+    @Published private(set) var homeSpaces: [String: [ACSpace]] = [:]
+    /// Cloud sleep profiles per AC id (`sleepProfile` endpoints).
+    @Published var sleepProfiles: [String: [SleepProfile]] = [:]
+    /// Schedules by rule id (`rms` rules), for profiles' `smartRuleId`.
+    @Published var sleepSchedules: [String: SleepSchedule] = [:]
+    /// Notification wall state.
+    @Published var notifications: [ACNotification] = []
+    @Published var unreadAlerts = 0
 
-    private let api = MirAIeAPI()
+    let api = MirAIeAPI()
     private let local = LocalACTransport()
     private var clients: [String: MQTTClient] = [:]
     private var connectedHomes = Set<String>()
     private var rediscoverTimer: Timer?
 
     var anyOn: Bool { devices.contains { $0.state.power } }
+
+    #if DEBUG
+    /// Every control message's fields, in order (self-checks; nothing is sent in harness runs).
+    var sentLog: [[String: Any]] = []
+    #endif
 
     init() {
         localOnly = UserDefaults.standard.bool(forKey: "acLocalOnly")
@@ -110,7 +128,8 @@ final class ACStore: ObservableObject {
             Task { @MainActor in await self?.connectTransports() }
         }
         Task {
-            loggedIn = await api.isLoggedIn || (localOnly && !devices.isEmpty)
+            cloudSignedIn = await api.isLoggedIn
+            loggedIn = cloudSignedIn || (localOnly && !devices.isEmpty)
             guard loggedIn else { return }
             if localOnly && !devices.isEmpty && devices.allSatisfy({ localInfo($0.id) != nil }) {
                 await connectTransports()
@@ -129,6 +148,7 @@ final class ACStore: ObservableObject {
         do {
             try await api.login(login, password: password)
             loggedIn = true
+            cloudSignedIn = true
             await reload()
         } catch {
             errorMessage = error.localizedDescription
@@ -142,6 +162,11 @@ final class ACStore: ObservableObject {
         UserDefaults.standard.removeObject(forKey: "acDevices")
         Task { await api.logout() }
         loggedIn = false
+        cloudSignedIn = false
+        sleepProfiles = [:]
+        sleepSchedules = [:]
+        notifications = []
+        unreadAlerts = 0
     }
 
     // MARK: Loading (cloud bootstrap)
@@ -155,6 +180,7 @@ final class ACStore: ObservableObject {
                 throw MirAIeError.badResponse
             }
             var list = parseDevices(homes)
+            homeSpaces = Self.parseSpaces(homes)
             for i in list.indices {
                 if let old = devices.first(where: { $0.id == list[i].id }) {
                     list[i].state = old.state
@@ -183,6 +209,10 @@ final class ACStore: ObservableObject {
             devices = list
             if let data = try? JSONEncoder().encode(list) { UserDefaults.standard.set(data, forKey: "acDevices") }
             errorMessage = nil
+            cloudSignedIn = true
+            if !localOnly {
+                Task { await self.loadCloudExtras() }
+            }
         } catch MirAIeError.notLoggedIn {
             if devices.isEmpty { logout() } else { errorMessage = "Sign in again to refresh keys" }
         } catch {
@@ -201,13 +231,26 @@ final class ACStore: ObservableObject {
                     guard let id = d["deviceId"] as? String else { continue }
                     let topic = (d["topic"] as? [String])?.first ?? "\(homeId)/\(id)"
                     let dev = ACDevice(id: id, name: d["deviceName"] as? String ?? "AC", space: spaceName,
-                                       homeId: homeId, topic: topic, modelId: d["modelId"] as? String)
+                                       homeId: homeId, spaceId: space["spaceId"] as? String,
+                                       topic: topic, modelId: d["modelId"] as? String)
                     all.append((dev, (d["category"] as? String ?? "").uppercased()))
                 }
             }
         }
         let acs = all.filter { $0.1 == "AC" || $0.1.hasPrefix("AC") || $0.1.contains("AIR") }
         return (acs.isEmpty ? all : acs).map(\.0)
+    }
+
+    private static func parseSpaces(_ homes: [[String: Any]]) -> [String: [ACSpace]] {
+        var out: [String: [ACSpace]] = [:]
+        for home in homes {
+            guard let homeId = home["homeId"] as? String else { continue }
+            out[homeId] = (home["spaces"] as? [[String: Any]] ?? []).compactMap { s in
+                guard let id = s["spaceId"] as? String else { return nil }
+                return ACSpace(id: id, name: s["spaceName"] as? String ?? "Room")
+            }
+        }
+        return out
     }
 
     private func model(_ modelId: String) async -> (ACKeys, Bool?, JSONValue?) {
@@ -484,29 +527,68 @@ final class ACStore: ObservableObject {
     // MARK: Controls
 
     private func send(_ device: ACDevice, key: String, value: Any, ki: Int) {
+        sendFields(device, [key: value], ki: ki)
+    }
+
+    /// Sends one control message. `fields` are the capability fields (e.g. `["acsp": "on", "pid": …]`);
+    /// the envelope is added per transport: LAN `ki 1, cnt an, sid 1`; MQTT `ki n, cnt an, sid 1`;
+    /// REST fallback (MQTT down) `ki n, cnt gva, sid 11` as in `GeofenceBroadcastReceiver`.
+    /// `ki < 0` omits `ki` on the cloud paths (the official app sends nanoe GA without it).
+    func sendFields(_ device: ACDevice, _ fields: [String: Any], ki: Int) {
+        #if DEBUG
+        sentLog.append(fields)
+        if Self.isHarness { return }
+        #endif
         switch device.transport {
         case .local:
-            let body: [String: Any] = [key: value, "ki": 1, "cnt": "an", "sid": "1"]
+            let body = fields.merging(["ki": 1, "cnt": "an", "sid": "1"]) { a, _ in a }
             if !local.send(deviceId: device.id, body) { errorMessage = "Local send failed" }
         case .cloud:
-            guard let client = clients[device.homeId] else { return }
-            let body: [String: Any] = [key: value, "ki": ki, "cnt": "an", "sid": "1"]
-            guard let data = try? JSONSerialization.data(withJSONObject: body) else { return }
-            client.publish(device.topic + "/control", data)
+            if let client = clients[device.homeId], connectedHomes.contains(device.homeId) {
+                var body = fields.merging(["cnt": "an", "sid": "1"]) { a, _ in a }
+                if ki >= 0 { body["ki"] = ki }
+                guard let data = try? JSONSerialization.data(withJSONObject: body) else { return }
+                client.publish(device.topic + "/control", data)
+            } else {
+                sendREST(device, fields, ki: ki)
+            }
         case .connecting, .unavailable:
             errorMessage = "\(device.name) is not reachable"
         }
     }
 
-    private func update(_ device: ACDevice, _ change: (inout ACState) -> Void) {
+    /// REST control (`POST deviceManagement/control`), used when MQTT isn't connected.
+    private func sendREST(_ device: ACDevice, _ fields: [String: Any], ki: Int) {
+        guard !localOnly else { errorMessage = "\(device.name) is not reachable"; return }
+        var params = fields.merging(["cnt": "gva", "sid": "11"]) { a, _ in a }
+        if ki >= 0 { params["ki"] = ki }
+        let body: [String: Any] = ["deviceId": device.id, "control_params": params]
+        Task {
+            do {
+                try await api.request("POST", "deviceManagement/control", body: body)
+            } catch {
+                errorMessage = "Cloud control failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func update(_ device: ACDevice, _ change: (inout ACState) -> Void) {
         guard let i = devices.firstIndex(where: { $0.id == device.id }) else { return }
         change(&devices[i].state)
     }
 
+    /// Mirrors `ACDevice.setPowerStatus`: turning on (mode ≠ fan) raises a target below 24° to 24°,
+    /// and any power change ends a non-default sleep profile.
     func setPower(_ d: ACDevice, _ on: Bool) {
         update(d) { $0.power = on }
         send(d, key: d.keys.power, value: on ? "on" : "off", ki: ACKeyIndex.power)
+        if on, d.state.mode != "fan", d.state.setTemp < 24, let c = current(d) {
+            setTemp(c, 24)
+        }
+        resetSleepProfileIfNeeded(d)
     }
+
+    func current(_ d: ACDevice) -> ACDevice? { devices.first { $0.id == d.id } }
 
     func setTemp(_ d: ACDevice, _ t: Double) {
         let r = d.tempRange
@@ -517,9 +599,57 @@ final class ACStore: ObservableObject {
         send(d, key: d.keys.temp, value: text, ki: ACKeyIndex.temp)
     }
 
+    /// Mirrors `ACDevice.setACMode`: on "Papagz" models (102010/102011) JetStream and EcoNavi are
+    /// switched off first; any mode change ends a non-default sleep profile.
     func setMode(_ d: ACDevice, _ mode: String) {
+        if d.isPapagz {
+            for name in ["JetStream", "EcoNavi"] {
+                if let cap = d.capability(name), d.isOn(cap), let c = current(d) { send(c, capability: cap, value: "off") }
+            }
+        }
         update(d) { $0.mode = mode }
         send(d, key: d.keys.mode, value: mode, ki: ACKeyIndex.mode)
+        resetSleepProfileIfNeeded(d)
+    }
+
+    /// Toggle with the official app's side effects (`ACDevice.setEcoMode`, `setACPowerfulMode`,
+    /// `setACJetStreamMode`, `setTurboMode`, `setEcoNaviVal`).
+    func setToggle(_ d: ACDevice, _ cap: ACCapability, _ on: Bool) {
+        func conv0() {
+            if let conv = d.capability("Convertible"), let c = current(d) { send(c, capability: conv, value: 0) }
+        }
+        func swing(_ name: String, _ v: Int) {
+            if let s = d.capability(name), let c = current(d) { send(c, capability: s, value: v) }
+        }
+        switch (cap.name, on) {
+        case ("ECOMode", true):
+            send(d, capability: cap, value: "on")
+            if let c = current(d) { setTemp(c, 26) }
+            resetSleepProfileIfNeeded(d)
+        case ("PowerfulMode", true):
+            resetSleepProfileIfNeeded(d)
+            conv0()
+            if let c = current(d) { send(c, capability: cap, value: "on") }
+        case ("JetStream", true):
+            conv0()
+            if let c = current(d) { send(c, capability: cap, value: "on") }
+            swing("VerticalSwing", 1)
+            swing("HorizontalSwing", 1)
+            resetSleepProfileIfNeeded(d)
+            if d.isPapagz, let navi = d.capability("EcoNavi"), d.isOn(navi), let c = current(d) {
+                send(c, capability: navi, value: "off")
+            }
+        case ("TurboMode", true):
+            send(d, capability: cap, value: "on")
+            swing("VerticalSwing", 1)
+        case ("EcoNavi", true):
+            send(d, capability: cap, value: "on")
+            if d.isPapagz, let jet = d.capability("JetStream"), d.isOn(jet), let c = current(d) {
+                send(c, capability: jet, value: "off")
+            }
+        default:
+            send(d, capability: cap, value: on ? "on" : "off")
+        }
     }
 
     /// Generic control for any model capability. Stored status updates optimistically.
@@ -651,7 +781,9 @@ extension ACStore {
     /// and status from the user's diagnostics (PROTOCOL.md §1.8), with an active off timer.
     func seedDemo() {
         loggedIn = true
-        var bedroom = ACDevice(id: "d1", name: "Bedroom AC", space: "Bedroom", homeId: "h", topic: "h/d1", modelId: "130185")
+        cloudSignedIn = true
+        homeSpaces = ["h": [ACSpace(id: "s1", name: "Bedroom"), ACSpace(id: "s2", name: "Living Room"), ACSpace(id: "s3", name: "Study")]]
+        var bedroom = ACDevice(id: "d1", name: "Bedroom AC", space: "Bedroom", homeId: "h", spaceId: "s1", topic: "h/d1", modelId: "130185")
         bedroom.state = ACState(power: true, mode: "cool", setTemp: 26, roomTemp: 32, fan: "auto", online: true)
         bedroom.transport = .cloud
         bedroom.udpCapable = false
@@ -665,17 +797,58 @@ extension ACStore {
             "actm": .array([.number(offAt), .number(-1)]),
             "errors": .string(""), "warnings": .string(""), "filterDustLevel": .number(0),
             "filterCleaningRequired": .bool(true), "filterCleaningCause": .string("Operating hours"),
-            "rssi": .number(-56), "onlineStatus": .string("true"),
+            "rssi": .number(-56), "onlineStatus": .string("true"), "totalOperatingHours": .number(212),
         ]
         var living = ACDevice(id: "d2", name: "Living Room AC", space: "Living Room", homeId: "h", topic: "h/d2", modelId: nil)
         living.state = ACState(power: false, mode: "dry", setTemp: 25.5, roomTemp: 30, fan: "low", online: true)
         living.transport = .cloud
-        devices = [bedroom, living]
+        var study = ACDevice(id: "d3", name: "Study AC", space: "Study", homeId: "h", spaceId: "s3", topic: "h/d3", modelId: "demo-rich")
+        study.state = ACState(power: true, mode: "cool", setTemp: 24, roomTemp: 29, fan: "auto", online: true)
+        study.transport = .local
+        study.model = try? JSONDecoder().decode(JSONValue.self, from: Data(Self.demoRichModel.utf8))
+        study.state.raw = [
+            "ps": .string("on"), "acmd": .string("cool"), "actmp": .string("24.0"), "acfs": .string("auto"),
+            "acvs": .number(0), "achs": .number(0), "cnv": .number(80), "acjs": .string("off"), "acen": .string("off"),
+            "acnga": .string("auto"), "achm": .string("off"), "acld": .string("off"), "acpm25": .string("74"),
+            "acsp": .string("p1"), "filterDustLevel": .number(35), "filterCleaningRequired": .bool(false),
+            "rssi": .number(-63), "V": .string("4.10"),
+        ]
+        devices = [bedroom, living, study]
+        let night = SleepProfile(id: "p1", name: "Cool night", temps: [24, 25, 26, 27, 27, 28], offAtEnd: true, ruleIds: ["r1"])
+        sleepProfiles = [
+            "d1": [SleepProfile(id: "p0", name: "default", temps: [26, 27, 27, 28, 28, 28, 28, 28], offAtEnd: false), night],
+            "d3": [night],
+        ]
+        sleepSchedules = ["r1": SleepSchedule(ruleId: "r1", hour: 22, minute: 30, weekdays: Set(2...6), enabled: true)]
+        unreadAlerts = 1
         profiles["d1"] = [
             ACProfile(name: "Night", power: true, mode: "cool", temp: 27, fan: "quiet", verticalSwing: 0, horizontalSwing: 0, display: "off"),
             ACProfile(name: "Quick cool", power: true, mode: "cool", temp: 22, fan: "high", verticalSwing: 0, horizontalSwing: 0, display: "on"),
         ]
     }
+
+    /// A feature-rich sample model (not a real one) to render every model-driven control.
+    static let demoRichModel = """
+    {"configCapabilities":[{"capability":"udpControl"}],
+     "controlCapabilities":[
+      {"capability":"ACMode","attributes":[{"key":"acmd","values":["auto","cool","dry","fan","heat"]}]},
+      {"capability":"ACFanSpeed","attributes":[{"key":"acfs","values":["auto","quiet","low","medium","high"]}]},
+      {"capability":"PowerStatus","attributes":[{"key":"ps"}]},
+      {"capability":"JetStream","attributes":[{"key":"acjs"}]},
+      {"capability":"EcoNavi","attributes":[{"key":"acen"}]},
+      {"capability":"NanoeGA","attributes":[{"key":"acnga"}]},
+      {"capability":"Humidifier","attributes":[{"key":"achm"}]},
+      {"capability":"LaundryMode","attributes":[{"key":"acld"}]},
+      {"capability":"Convertible","attributes":[{"key":"cnv","intValues":[110,100,90,80,70,55,40,0]}]},
+      {"capability":"VerticalSwing","attributes":[{"key":"acvs","range":{"increment":[{"value":1}],"max":[{"value":5}],"min":[{"value":0}]}}]},
+      {"capability":"HorizontalSwing","attributes":[{"key":"achs","range":{"increment":[{"value":1}],"max":[{"value":5}],"min":[{"value":0}]}}]},
+      {"capability":"SleepProfile","attributes":[{"key":"acsp"}]},
+      {"capability":"FilterDustLevel","attributes":[{"key":"filterDustLevel"},{"key":"acfcal"}]},
+      {"capability":"FilterCalibration","attributes":[{"key":"acfcal"}]},
+      {"capability":"PM25Sensor","attributes":[{"key":"acpm25"}]}
+     ],
+     "statusCapabilitiesV2":[{"capability":"PowerConsumption"}]}
+    """
 
     /// Model 130185 exactly as returned by `deviceManagement/deviceModels/modelId/130185`.
     static let demoModel = """

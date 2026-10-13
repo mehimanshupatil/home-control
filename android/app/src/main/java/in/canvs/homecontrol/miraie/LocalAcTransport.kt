@@ -102,11 +102,14 @@ class LocalAcTransport(
     }
 
     /** Encrypts `{key: value, ki: 1, cnt: "an", sid: "1"}` and sends it to the AC. */
-    suspend fun send(deviceId: String, key: String, value: Any) = withContext(Dispatchers.IO) {
+    suspend fun send(deviceId: String, key: String, value: Any) = sendFields(deviceId, JSONObject().put(key, value))
+
+    /** Sends [fields] with the LAN envelope (`ki` is always 1 on this path, as `UDPService`). */
+    suspend fun sendFields(deviceId: String, fields: JSONObject) = withContext(Dispatchers.IO) {
         val entry = entries[deviceId] ?: error("No local keys for device")
         val ip = entry.ip ?: error("AC not found on LAN")
         val s = socket ?: error("Local transport not started")
-        val json = JSONObject().put(key, value).put("ki", 1).put("cnt", "an").put("sid", "1").toString()
+        val json = JSONObject(fields.toString()).put("ki", 1).put("cnt", "an").put("sid", "1").toString()
         val data = crypt(Cipher.ENCRYPT_MODE, entry.keys, zeroPad(json.toByteArray()))
         s.send(DatagramPacket(data, data.size, InetAddress.getByName(ip), PORT))
     }

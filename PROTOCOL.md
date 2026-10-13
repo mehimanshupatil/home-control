@@ -128,10 +128,14 @@ Each model's `controlCapabilities[]` lists the subset it supports; the MQTT/UDP 
 | PM25Sensor | 20 | status only |
 | EcoNavi | 21 | `on`/`off` |
 | NanoeX | 23 | `on`/`off` |
+| NanoeGA | 24 | `off` / `on` / `auto` (cycled); sent **without `ki`** on MQTT/REST (`SingleValueCapability.buildMessage(json, str)`) |
 | TimeBasedFilterHealth | 25 | status only |
 | EconomySensor | 27 | `on`/`off` |
+| FilterCalibration | 26 | `{"<key>":"on"}` → status `complete` |
 | Convertible | 28 | int: 40 50 55 60 70 80 90 100 110, off→0 |
+| LaundryMode | 29 | `on`/`off` |
 | BuzzerControl | 30 | `on`/`off` |
+| Humidifier | 258 | `on`/`off` |
 | RoomTemperature | 101 | status |
 | RoomHumidity | 102 | status |
 | CurrentPowerConsumption | 104 | status |
@@ -164,6 +168,76 @@ Observed from diagnostics on 2026-10-13:
 
 Response: `[{ "day" | "week" | "month": "<label>", "power": "<kWh as string>" }]`. The unit shown in the app is **kWh**.
 Days with no data may be missing; the app fills gaps with zero. The home-level `powerConsumption/homes/{homeId}` endpoint belongs to the third-party "Ohm" integration, not the AC.
+Bucket labels in the response are the request formats: `day`/`week` = `ddMMyyyy` (a week is keyed by its first day), `month` = `MMyyyy`.
+
+### 1.10 Sleep profiles (cloud store + device command)
+
+Endpoints (`IDeviceService`), all under `{API}homeManagement/homes/{homeId}/spaces/{spaceId}/devices/{deviceId}/`:
+
+| Call | Body / response |
+|---|---|
+| `GET sleepProfile` | `[{ "profileId", "profileName", "smartRuleId": [ruleId], "temperatures": ["24.0", …] }]` |
+| `POST sleepProfile` | `{ "profileName", "temperatures" }` (`SleepProfileEntity`; null fields omitted) |
+| `PUT sleepProfile/{profileId}` | `{ "profileName", "temperatures" }` (`SleepProfileRequestEntity`) |
+| `DELETE sleepProfile/{profileId}` | — (the app deletes the profile's rule first) |
+
+- `temperatures`: one entry per hour, formatted `%04.1f`; a trailing `"00.0"` means "turn the AC off at the end".
+  Hours and temperature limits come from the model's SleepProfile attributes `duration` (2–8 h on 130185) and `temps`.
+- The profile named `default` is built in (shown as "Regular"); the app allows at most **3** custom profiles.
+- **Activate / stop** (`ACProfileCapability.buildMessage`, ki 12):
+  `{"acsp": "on"|"off", "ki": 12, "pid": "<profileId>" | "default", "temps": ["24.0", …]}`.
+  Starting a custom profile while in Fan mode also sends `ACMode = auto`.
+- Status `acsp` holds the **running profile id** (`"default"` for the built-in one); `"none"`/empty = not running.
+- Changing power, mode, ECO (on), Powerful (on) or JetStream (on) stops a running non-default profile (`resetSleepProfileIfNeeded`).
+
+### 1.11 Schedules (`rms` rules)
+
+`IRuleService`, under `{API}rms/homes/{homeId}/rules`:
+`GET` (list of rule ids), `GET /{ruleId}`, `POST`, `PUT /{ruleId}`, `DELETE /{ruleId}`,
+`PUT /pause` body `[{"ruleId", "action": "pause", "startTime": "<ms>", "endTime"?: "<ms>"}]`, `PUT /resume` body `["<ruleId>"]`.
+
+Sleep-profile schedule body (`RuleItem.getRulePayload`):
+```json
+{ "ruleName": "Schedule <name>", "homeId": "…", "userId": "…", "primaryUserId": "…",
+  "ruleType": "User", "schemaVersion": "v2", "ruleStatus": "ENABLE",
+  "triggers": [[{ "type": "Timer", "check": "EQ", "property": "Time", "value": 2230,
+                  "repeatType": "daily" | "once" | "S,M,T,W,TH,F,SA" }]],
+  "rule": { "sendPushNotification": true,
+            "actions": [{ "deviceId": "…", "profileId": "…", "payloadVersion": "0.1",
+                          "payload": "{\"acsp\":\"on\",\"ki\":12,\"pid\":\"<id>\"}" }] } }
+```
+`value` is `HH*100+MM`. Day codes are Sunday-first. `ruleStatus` is `ENABLE`, `PAUSE` (with `pauseDetails.pauseStartTime/pauseEndTime` in ms) or `DISABLE`.
+Create returns `{status, ruleId}`; the server links the rule to the profile (`smartRuleId`) — the app never writes it.
+
+### 1.12 Filter health and reset
+
+- Status: `filterCleaningRequired` (bool), `filterCleaningCause` (`dust` | `time`), `filterDustLevel` (int %), `totalOperatingHours`.
+- `TimeBasedFilterHealth` attribute `range` has `reminder`/`warning`/`alert` hours (100/200/500 on 130185).
+- Reset (`FilterCleanInstructionActivity`): time-based models → `PUT {API}deviceManagement/devices/{id}/filterDustLevelInfo` (no body), then re-`GET …/mobile/status`.
+  Dust-based models → device command `{"<FilterCalibration attributes[0].key>": "on", "ki": 26}`; the app waits up to 1 min for that key to read `complete`.
+
+### 1.13 REST control, rename, move, firmware, notifications
+
+- **REST control** (`GeofenceBroadcastReceiver`): `POST {API}deviceManagement/control`
+  `{"deviceId": "…", "control_params": {"ps": "on", "cnt": "gva", "ki": 1, "sid": "11"}}`. Only the power key is observed in the app; other keys through this endpoint are *unverified*.
+- **Rename**: `PUT {API}homeManagement/homes/{h}/spaces/{s}/devices/{d}` `{"deviceName": "…"}`.
+- **Move room**: `POST {API}homeManagement/homes/{h}/spaces/{s}/devices/{d}` `{"newSpaceId": "…"}`.
+- **Firmware check**: `GET {API}fota/firmware/deviceId/{id}/download?currentVersion=<V>` → `{firmwareVersion, isLatestVersion, url, signatureUrl, message, modelNumber, cd}`. (The update itself is MQTT `<topic>/fcontrol`; not used by our apps.)
+- **Notifications**: `GET {API}notificationmanager/log?severity=alert|info|recommendation|promotion&pgIndex=<1…>&pgSize=20` →
+  `[{notificationId, uniqueId, taskId, severity, ts (s), isFeedbackRequired, feedback, message: {payload: {title, message|text, category, deviceId, deviceName}}}]`.
+  Unread: `GET {API}notificationmanager/unexpired/count?severity=alert` → `{unexpired}`.
+
+### 1.14 Official side effects (`ACDevice`)
+
+| Action | Also sends |
+|---|---|
+| Power on, mode ≠ fan, target < 24° | `actmp 24.0` |
+| ECO on | `actmp 26.0` |
+| Powerful on | `Convertible 0` first |
+| JetStream on | `Convertible 0` first; then V and H swing `1`; on Papagz models (102010/102011) EcoNavi off |
+| Turbo on | V swing `1` |
+| Mode change (Papagz) | JetStream off, EcoNavi off first |
+| nanoe GA | one value cycling `off → on → auto` (ki 24) |
 
 ---
 

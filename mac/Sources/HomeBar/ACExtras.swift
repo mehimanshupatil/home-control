@@ -74,8 +74,10 @@ struct ACInfoRow: View {
         if let h = declared("RoomHumidity")?.doubleValue {
             out.append(Item(id: "hum", text: String(format: "Humidity %.0f%%", h), symbol: "humidity"))
         }
-        if let pm = declared("PM25Sensor")?.doubleValue {
-            out.append(Item(id: "pm", text: String(format: "PM2.5 %.0f", pm), symbol: "aqi.low"))
+        if let pm = declared("PM25Sensor")?.doubleValue, pm >= 0 {
+            let band = Self.pm25Band(Int(pm))
+            out.append(Item(id: "pm", text: String(format: "PM2.5 %.0f · %@", pm, band.label), symbol: "aqi.low",
+                            style: band.level >= 3 ? .warning : .plain, help: "Air quality: \(band.label)"))
         }
         if let w = declared("CurrentPowerConsumption")?.doubleValue {
             out.append(Item(id: "power", text: String(format: "%.0f W", w), symbol: "bolt"))
@@ -104,6 +106,18 @@ struct ACInfoRow: View {
             out.append(Item(id: "error", text: "Error \(errors)", symbol: "exclamationmark.triangle.fill", style: .fault))
         }
         return out
+    }
+
+    /// `ACDevice.getAQIPM25Level` bands (µg/m³).
+    static func pm25Band(_ v: Int) -> (label: String, level: Int) {
+        switch v {
+        case 0...30: ("Excellent", 0)
+        case 31...60: ("Good", 1)
+        case 61...90: ("Moderate", 2)
+        case 91...120: ("Poor", 3)
+        case 121...250: ("Unhealthy", 4)
+        default: ("Hazardous", 5)
+        }
     }
 
     var body: some View {
@@ -292,6 +306,7 @@ struct ACMoreControls: View {
     var body: some View {
         let caps = caps
         let toggles = ACCapability.toggleNames.compactMap { n in caps.first { $0.name == n && $0.kind == .toggle } }
+        let cycles = caps.filter { if case .cycle = $0.kind { return true } else { return false } }
         let choiceCaps = caps.filter { if case .choice = $0.kind { return true } else { return false } }
         let intCaps = ["VerticalSwing", "HorizontalSwing", "Convertible", "ACGenMode"].compactMap { n in
             caps.first { $0.name == n }
@@ -308,14 +323,27 @@ struct ACMoreControls: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            if !toggles.isEmpty {
+            if !toggles.isEmpty || !cycles.isEmpty {
                 LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 4), count: 4), spacing: 4) {
                     ForEach(toggles) { cap in
-                        let on = device.state.raw[cap.key]?.stringValue?.lowercased() == "on"
+                        let on = device.isOn(cap)
                         OptionTile(title: cap.label, symbol: cap.symbol, selected: on, tint: tint, muted: muted) {
-                            ac.send(device, capability: cap, value: on ? "off" : "on")
+                            ac.setToggle(device, cap, !on)
                         }
                         .help("\(cap.label): \(on ? "on" : "off")")
+                    }
+                    ForEach(cycles) { cap in
+                        if case .cycle(let values) = cap.kind {
+                            let value = device.state.raw[cap.key]?.stringValue?.lowercased() ?? "off"
+                            let next = values[((values.firstIndex(of: value) ?? -1) + 1) % values.count]
+                            OptionTile(title: value == "off" ? cap.label : "\(cap.label) \(value)", symbol: cap.symbol,
+                                       selected: value != "off", tint: tint, muted: muted) {
+                                // Official app: SingleValueCapability.buildMessage(json, str) sends no `ki`.
+                                ac.sendFields(device, [cap.key: next], ki: -1)
+                                ac.update(device) { $0.raw[cap.key] = .string(next) }
+                            }
+                            .help("\(cap.label): \(value) — click for \(next)")
+                        }
                     }
                 }
             }

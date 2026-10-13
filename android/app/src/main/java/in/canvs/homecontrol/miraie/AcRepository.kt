@@ -17,6 +17,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.time.LocalDate
 import java.util.concurrent.ConcurrentHashMap
 
 data class AcUiState(
@@ -30,7 +31,18 @@ data class AcUiState(
     val devices: List<AcState> = emptyList(),
     /** Local profiles per device id. */
     val profiles: Map<String, List<AcProfile>> = emptyMap(),
-)
+    /** Signed in to the MirAIe cloud (key-code-only setups are [loggedIn] but not signed in). */
+    val signedIn: Boolean = false,
+    /** MirAIe sleep profiles per device id (cloud); null entry = not loaded yet. */
+    val sleepProfiles: Map<String, List<SleepProfile>> = emptyMap(),
+    /** Sleep-profile schedules by rule id (cloud). */
+    val sleepRules: Map<String, SleepRule> = emptyMap(),
+    /** Unread MirAIe alerts (cloud), shown in the menu. */
+    val unreadAlerts: Int = 0,
+) {
+    /** Cloud features need a MirAIe sign-in and Local-only off. */
+    val cloudAvailable: Boolean get() = signedIn && !localOnly
+}
 
 /**
  * App-wide owner of MirAIe ACs. Local LAN control (UDP 5001) is preferred; MQTT is the fallback.
@@ -50,6 +62,7 @@ class AcRepository(context: Context, private val store: SecureStore) {
             localOnly = store.localOnly,
             experimentalLocal = store.experimentalLocal,
             devices = loadCache(),
+            signedIn = api.isLoggedIn,
         ).let { it.copy(profiles = it.devices.associate { d -> d.device.deviceId to loadProfiles(d.device.deviceId) }) },
     )
     val state: StateFlow<AcUiState> = _state.asStateFlow()
@@ -69,7 +82,7 @@ class AcRepository(context: Context, private val store: SecureStore) {
         _state.update { it.copy(loading = true, error = null) }
         try {
             api.login(login, password)
-            _state.update { it.copy(loggedIn = true) }
+            _state.update { it.copy(loggedIn = true, signedIn = true) }
             refresh(forceCloud = true)
         } catch (e: Exception) {
             _state.update { it.copy(loading = false, error = e.message ?: "Login failed") }
@@ -136,11 +149,16 @@ class AcRepository(context: Context, private val store: SecureStore) {
                 s.copy(
                     loading = false,
                     devices = devices,
+                    signedIn = api.isLoggedIn,
                     profiles = devices.associate { d -> d.device.deviceId to loadProfiles(d.device.deviceId) },
                 )
             }
 
             if (!localOnly && devices.any { it.transport == Transport.Cloud }) connectMqtt(devices)
+            if (_state.value.cloudAvailable) {
+                devices.forEach { d -> if (d.spec("SleepProfile") != null || d.capabilities.isEmpty()) runCatching { loadSleepProfiles(d.device.deviceId) } }
+                runCatching { refreshUnread() }
+            }
         } catch (e: Exception) {
             if (e is MiraieException && e.code == 401 && !localOnly) logout()
             _state.update { it.copy(loading = false, error = e.message ?: "Failed to load devices") }
@@ -230,7 +248,9 @@ class AcRepository(context: Context, private val store: SecureStore) {
 
     /** Debug builds only: sample ACs for UI screenshots (`adb shell am start ... --ez demo true`). Mirrors real model 130185. */
     fun seedDemo() {
-        fun dev(id: String, name: String, space: String, model: String?) = MiraieDevice(id, name, model, "AC", "h/$id", "h", space)
+        demo = true
+        fun dev(id: String, name: String, space: String, model: String?) =
+            MiraieDevice(id, name, model, "AC", "h/$id", "h", space, spaceId = if (id == "d1") "s1" else "s2")
         val now = System.currentTimeMillis() / 1000
         val status = JSONObject(DEMO_STATUS).put("actm", JSONArray(listOf(now + 95 * 60, -1))).toMap()
         val bedroom = AcState(
@@ -254,14 +274,48 @@ class AcRepository(context: Context, private val store: SecureStore) {
             experimentalLocal = store.experimentalLocal,
             devices = listOf(bedroom, living),
             profiles = mapOf("d1" to profiles),
+            signedIn = !store.localOnly,
+            sleepProfiles = mapOf(
+                "d1" to listOf(
+                    SleepProfile("default", "default", listOf(25.0, 26.0, 27.0, 27.0, 27.0, 26.0, 26.0, 26.0), offAtEnd = false),
+                    SleepProfile("p1", "Cool night", listOf(24.0, 25.0, 26.0, 27.0, 27.0, 28.0), offAtEnd = true, ruleIds = listOf("r1")),
+                ),
+            ),
+            sleepRules = mapOf("r1" to SleepRule("r1", Schedule(22, 30, setOf(1, 2, 3, 4, 5, 6, 7)), "ENABLE")),
+            unreadAlerts = 2,
         )
     }
 
-    fun setPower(deviceId: String, on: Boolean) =
-        send(deviceId, Capability.Power, if (on) "on" else "off") { it.copy(power = on) }
+    /** Power with the official side effects (raise temp to 24 when turning on below it; stop a custom sleep profile). */
+    fun setPower(deviceId: String, on: Boolean) {
+        val ac = device(deviceId) ?: return
+        sendCommands(deviceId, SideEffects.power(ac, on, sleepProfilesOf(deviceId)))
+    }
 
-    fun setMode(deviceId: String, mode: String) =
-        send(deviceId, Capability.Mode, mode) { it.copy(mode = mode) }
+    /** Mode change also stops a running custom sleep profile (official behaviour). */
+    fun setMode(deviceId: String, mode: String) {
+        val ac = device(deviceId) ?: return
+        sendCommands(deviceId, SideEffects.mode(ac, mode, sleepProfilesOf(deviceId)))
+    }
+
+    /** A model toggle (ECO, Powerful, JetStream, …) with the official side effects. */
+    fun setToggle(deviceId: String, spec: CapabilitySpec, on: Boolean) {
+        val ac = device(deviceId) ?: return
+        sendCommands(deviceId, SideEffects.toggle(ac, spec, on, sleepProfilesOf(deviceId)))
+    }
+
+    /** nanoe GA: off → on → auto → off (`NanoeGAControlViewHolder.loadNextState`). */
+    fun cycle(deviceId: String, spec: CapabilitySpec) {
+        val ac = device(deviceId) ?: return
+        val current = ac.statusOf(spec)?.toString()?.lowercase()
+        val i = spec.values.indexOf(current)
+        val next = if (i < 0) spec.values.first() else spec.values[(i + 1) % spec.values.size]
+        sendRaw(deviceId, spec.key, next, spec.ki)
+    }
+
+    private fun device(deviceId: String) = _state.value.devices.firstOrNull { it.device.deviceId == deviceId }
+
+    private fun sleepProfilesOf(deviceId: String) = _state.value.sleepProfiles[deviceId].orEmpty()
 
     fun setFanSpeed(deviceId: String, speed: String) =
         send(deviceId, Capability.FanSpeed, speed) { it.copy(fanSpeed = speed) }
@@ -285,6 +339,234 @@ class AcRepository(context: Context, private val store: SecureStore) {
         val payload = TimerMath.payload(offSlot, if (minutes > 0) minutes * 60L else -1L, ac.rawStatus[timer.key], now)
         val utc = JSONArray(TimerMath.toUtc(payload, now))
         sendKey(deviceId, timer.key, TimerSpec.KI, JSONArray(payload), statusValue = utc) { it }
+    }
+
+    // ---- cloud features (docs/FEATURES.md) --------------------------------------------------------
+
+    /** Debug demo mode: cloud calls return sample data and nothing is sent anywhere. */
+    @Volatile
+    private var demo = false
+
+    private fun requireCloud() {
+        if (!demo && !_state.value.cloudAvailable) throw MiraieException(NEEDS_SIGN_IN)
+    }
+
+    /** Energy history for one grain (cloud). Missing days/weeks/months are zero-filled. */
+    suspend fun energy(deviceId: String, grain: EnergyGrain): EnergyWindow = withContext(Dispatchers.IO) {
+        val window = EnergyMath.window(grain, LocalDate.now())
+        if (demo) return@withContext demoEnergy(window)
+        requireCloud()
+        EnergyMath.fill(window, api.energy(deviceId, window))
+    }
+
+    /** Loads MirAIe sleep profiles and their schedules for one AC (cloud). */
+    suspend fun loadSleepProfiles(deviceId: String): Unit = withContext(Dispatchers.IO) {
+        val ac = device(deviceId) ?: return@withContext
+        if (demo) return@withContext
+        requireCloud()
+        if (ac.device.spaceId.isEmpty()) throw MiraieException("Refresh once while signed in to load room info")
+        val list = SleepProfile.sorted(api.sleepProfiles(ac.device))
+        _state.update { it.copy(sleepProfiles = it.sleepProfiles + (deviceId to list)) }
+        val rules = list.flatMap { it.ruleIds }.distinct().mapNotNull { id ->
+            runCatching { SleepRule.fromJson(id, api.rule(ac.device.homeId, id)) }.getOrNull()
+        }
+        _state.update { it.copy(sleepRules = it.sleepRules + rules.associateBy { r -> r.ruleId }) }
+    }
+
+    /** Creates (no id) or updates a sleep profile, then reloads the list. Max [SleepProfile.MAX_CUSTOM] custom. */
+    suspend fun saveSleepProfile(deviceId: String, profile: SleepProfile): Unit = withContext(Dispatchers.IO) {
+        val ac = device(deviceId) ?: return@withContext
+        if (demo) {
+            val saved = if (profile.id == null) profile.copy(id = "demo-${System.currentTimeMillis()}") else profile
+            updateSleep(deviceId) { list -> SleepProfile.sorted(list.filter { it.id != saved.id } + saved) }
+            return@withContext
+        }
+        requireCloud()
+        val existing = sleepProfilesOf(deviceId)
+        if (profile.id == null && existing.count { !it.isDefault } >= SleepProfile.MAX_CUSTOM) {
+            throw MiraieException("You can have up to ${SleepProfile.MAX_CUSTOM} custom sleep profiles")
+        }
+        if (profile.id == null) api.createSleepProfile(ac.device, profile) else api.updateSleepProfile(ac.device, profile)
+        loadSleepProfiles(deviceId)
+    }
+
+    /** Deletes a profile's schedules first, then the profile (official order). */
+    suspend fun deleteSleepProfile(deviceId: String, profile: SleepProfile): Unit = withContext(Dispatchers.IO) {
+        val ac = device(deviceId) ?: return@withContext
+        val id = profile.id ?: return@withContext
+        if (demo) {
+            updateSleep(deviceId) { list -> list.filter { it.id != id } }
+            return@withContext
+        }
+        requireCloud()
+        profile.ruleIds.forEach { runCatching { api.deleteRule(ac.device.homeId, it) } }
+        api.deleteSleepProfile(ac.device, id)
+        _state.update { it.copy(sleepRules = it.sleepRules - profile.ruleIds.toSet()) }
+        loadSleepProfiles(deviceId)
+    }
+
+    /**
+     * Starts or stops a sleep profile on the AC (`ACDevice.updateProfileStatus`). Starting a custom profile
+     * in Fan mode also switches the AC to Auto.
+     */
+    fun setSleepProfileActive(deviceId: String, profile: SleepProfile, on: Boolean) {
+        val ac = device(deviceId) ?: return
+        val commands = buildList {
+            add(Command(profile.activationFields(on), ac.spec("SleepProfile")?.ki ?: SleepProfile.KI))
+            if (on && !profile.isDefault && ac.mode == "fan") add(Command.of(ac.key(Capability.Mode), "auto", Capability.Mode.ki))
+        }
+        sendCommands(deviceId, commands)
+        // acsp reports the active profile id, or "none".
+        updateDevice(deviceId) { it.copy(rawStatus = it.rawStatus + (SleepProfile.KEY to if (on) profile.pid else "none")) }
+    }
+
+    /** Creates or replaces the schedule (rms rule) that starts [profile] at [schedule]. */
+    suspend fun scheduleSleep(deviceId: String, profile: SleepProfile, schedule: Schedule): Unit = withContext(Dispatchers.IO) {
+        val ac = device(deviceId) ?: return@withContext
+        val existing = profile.ruleIds.firstOrNull()
+        if (demo) {
+            val id = existing ?: "rule-${System.currentTimeMillis()}"
+            _state.update { it.copy(sleepRules = it.sleepRules + (id to SleepRule(id, schedule, "ENABLE"))) }
+            updateSleep(deviceId) { list -> list.map { if (it.id == profile.id && id !in it.ruleIds) it.copy(ruleIds = it.ruleIds + id) else it } }
+            return@withContext
+        }
+        requireCloud()
+        val userId = store.userId ?: throw MiraieException(NEEDS_SIGN_IN)
+        val ki = ac.spec("SleepProfile")?.ki ?: SleepProfile.KI
+        val body = RulePayloads.sleepRule(ac.device.homeId, userId, RulePayloads.ruleName(profile), deviceId, profile, ki, schedule, existing)
+        val ruleId = if (existing != null) api.updateRule(ac.device.homeId, existing, body) else api.createRule(ac.device.homeId, body)
+        // The server links the rule to the profile (smartRuleId); keep it locally too until the reload.
+        _state.update { it.copy(sleepRules = it.sleepRules + (ruleId to SleepRule(ruleId, schedule, "ENABLE"))) }
+        updateSleep(deviceId) { list -> list.map { if (it.id == profile.id && ruleId !in it.ruleIds) it.copy(ruleIds = it.ruleIds + ruleId) else it } }
+        runCatching { loadSleepProfiles(deviceId) }
+    }
+
+    suspend fun deleteSchedule(deviceId: String, ruleId: String): Unit = withContext(Dispatchers.IO) {
+        val ac = device(deviceId) ?: return@withContext
+        if (!demo) {
+            requireCloud()
+            api.deleteRule(ac.device.homeId, ruleId)
+        }
+        _state.update { it.copy(sleepRules = it.sleepRules - ruleId) }
+        updateSleep(deviceId) { list -> list.map { it.copy(ruleIds = it.ruleIds - ruleId) } }
+    }
+
+    /** Pauses (indefinitely, from now) or resumes a schedule (`RuleService.pauseRule` / `resumeRule`). */
+    suspend fun setScheduleEnabled(deviceId: String, ruleId: String, enabled: Boolean): Unit = withContext(Dispatchers.IO) {
+        val ac = device(deviceId) ?: return@withContext
+        if (!demo) {
+            requireCloud()
+            if (enabled) api.resumeRule(ac.device.homeId, ruleId)
+            else api.pauseRule(ac.device.homeId, RulePayloads.pause(ruleId, System.currentTimeMillis()))
+        }
+        _state.update { s ->
+            val r = s.sleepRules[ruleId] ?: return@update s
+            s.copy(sleepRules = s.sleepRules + (ruleId to r.copy(status = if (enabled) "ENABLE" else "PAUSE")))
+        }
+    }
+
+    /**
+     * Filter reset. Time-based models: `PUT filterDustLevelInfo`, then re-read status (cloud).
+     * Dust-based models: the `FilterCalibration` command, waiting up to 1 min for `complete`.
+     * Returns a short result message.
+     */
+    suspend fun resetFilter(deviceId: String): String = withContext(Dispatchers.IO) {
+        val ac = device(deviceId) ?: return@withContext "AC not found"
+        if (ac.spec("TimeBasedFilterHealth") != null) {
+            if (demo) {
+                updateDevice(deviceId) { it.copy(rawStatus = it.rawStatus + ("totalOperatingHours" to 0) + ("filterCleaningRequired" to false)) }
+                return@withContext "Filter timer reset"
+            }
+            requireCloud()
+            api.resetFilter(deviceId)
+            runCatching { api.status(deviceId) }.getOrNull()?.let { st -> updateDevice(deviceId) { applyStatus(it, st) } }
+            return@withContext "Filter timer reset"
+        }
+        val cal = ac.spec("FilterCalibration") ?: return@withContext "This AC has no filter reset"
+        sendCommands(deviceId, listOf(Command.of(cal.key, "on", cal.ki)))
+        if (demo) return@withContext "Filter calibration started"
+        val deadline = System.currentTimeMillis() + 60_000
+        while (System.currentTimeMillis() < deadline) {
+            if (device(deviceId)?.rawStatus?.get(cal.key)?.toString().equals("complete", ignoreCase = true)) return@withContext "Filter calibrated"
+            delay(2_000)
+        }
+        "Calibration sent; the AC hasn't confirmed yet"
+    }
+
+    suspend fun renameDevice(deviceId: String, name: String): Unit = withContext(Dispatchers.IO) {
+        val ac = device(deviceId) ?: return@withContext
+        val trimmed = name.trim().ifEmpty { return@withContext }
+        if (!demo) {
+            requireCloud()
+            api.renameDevice(ac.device, trimmed)
+        }
+        updateDevice(deviceId) { it.copy(device = it.device.copy(name = trimmed)) }
+        if (!demo) saveCache(_state.value.devices)
+    }
+
+    suspend fun spaces(deviceId: String): List<Space> = withContext(Dispatchers.IO) {
+        val ac = device(deviceId) ?: return@withContext emptyList()
+        if (demo) return@withContext listOf(Space("s1", "Bedroom"), Space("s2", "Living Room"), Space("s3", "Study"))
+        requireCloud()
+        api.homes().firstOrNull { it.homeId == ac.device.homeId }?.spaces.orEmpty()
+    }
+
+    suspend fun moveDevice(deviceId: String, space: Space): Unit = withContext(Dispatchers.IO) {
+        val ac = device(deviceId) ?: return@withContext
+        if (space.id == ac.device.spaceId) return@withContext
+        if (!demo) {
+            requireCloud()
+            api.moveDevice(ac.device, space.id)
+        }
+        updateDevice(deviceId) { it.copy(device = it.device.copy(spaceId = space.id, space = space.name)) }
+        if (!demo) saveCache(_state.value.devices)
+    }
+
+    /** Checks for newer firmware; never installs (use the MirAIe app for that). */
+    suspend fun checkFirmware(deviceId: String): FirmwareInfo = withContext(Dispatchers.IO) {
+        val ac = device(deviceId) ?: throw MiraieException("AC not found")
+        val current = ac.rawStatus["V"]?.toString().orEmpty()
+        if (demo) return@withContext FirmwareInfo(latestVersion = "3.05", isLatest = false, message = null)
+        requireCloud()
+        if (current.isEmpty()) throw MiraieException("Firmware version not reported yet")
+        api.firmware(deviceId, current)
+    }
+
+    suspend fun notifications(severity: String, page: Int): List<AcNotification> = withContext(Dispatchers.IO) {
+        if (demo) return@withContext if (page > 1) emptyList() else demoNotifications(severity)
+        requireCloud()
+        api.notifications(severity, page)
+    }
+
+    suspend fun refreshUnread(): Unit = withContext(Dispatchers.IO) {
+        if (demo || !_state.value.cloudAvailable) return@withContext
+        val n = api.unreadAlerts()
+        _state.update { it.copy(unreadAlerts = n) }
+    }
+
+    private fun updateSleep(deviceId: String, transform: (List<SleepProfile>) -> List<SleepProfile>) {
+        _state.update { it.copy(sleepProfiles = it.sleepProfiles + (deviceId to transform(it.sleepProfiles[deviceId].orEmpty()))) }
+    }
+
+    private fun demoEnergy(window: EnergyWindow): EnergyWindow {
+        val base = when (window.grain) { EnergyGrain.Daily -> 6.0; EnergyGrain.Weekly -> 38.0; EnergyGrain.Monthly -> 150.0 }
+        return window.copy(
+            buckets = window.buckets.mapIndexed { i, b ->
+                val wave = (kotlin.math.sin(i * 1.3) + 1.2) / 2.2
+                b.copy(kwh = if (window.grain == EnergyGrain.Daily && i == 2) 0.0 else Math.round(base * (0.5 + wave) * 10) / 10.0)
+            },
+        )
+    }
+
+    private fun demoNotifications(severity: String): List<AcNotification> {
+        val now = System.currentTimeMillis()
+        val all = listOf(
+            AcNotification("n1", "alert", now - 3_600_000L, "Clean the filter", "Bedroom AC has run 230 hours since the last filter clean.", "Bedroom AC"),
+            AcNotification("n2", "alert", now - 26 * 3_600_000L, "AC went offline", "Living Room AC lost its connection.", "Living Room AC"),
+            AcNotification("n3", "info", now - 50 * 3_600_000L, "Sleep profile", "Cool night started at 22:30.", "Bedroom AC"),
+            AcNotification("n4", "recommendation", now - 72 * 3_600_000L, "Save energy", "Setting 26° with ECO uses less power on hot nights.", null),
+        )
+        return all.filter { it.severity == severity }
     }
 
     // ---- local profiles -------------------------------------------------------------------------
@@ -432,6 +714,7 @@ class AcRepository(context: Context, private val store: SecureStore) {
         val ac = _state.value.devices.firstOrNull { it.device.deviceId == deviceId } ?: return
         val key = rawKey ?: ac.key(cap!!)
         updateDevice(deviceId) { optimistic(it).let { o -> o.copy(rawStatus = o.rawStatus + (key to statusValue)) } }
+        if (demo) return
         scope.launch {
             try {
                 when {
@@ -459,13 +742,68 @@ class AcRepository(context: Context, private val store: SecureStore) {
         }
     }
 
-    private suspend fun sendCloud(ac: AcState, key: String, ki: Int, value: Any) {
-        val conn = connections[ac.device.homeId] ?: run {
-            connectMqtt(_state.value.devices)
-            connections[ac.device.homeId]
-        } ?: error("No cloud connection")
-        if (!conn.isConnected) conn.connect(api.validToken())
-        conn.publishControl(ac.device.topic, key, value, ki)
+    private suspend fun sendCloud(ac: AcState, key: String, ki: Int, value: Any) =
+        sendCloudFields(ac, JSONObject().put(key, value), ki)
+
+    /** MQTT first; when the broker is unreachable, the REST control endpoint (as the official geofence path). */
+    private suspend fun sendCloudFields(ac: AcState, fields: JSONObject, ki: Int) {
+        if (demo) return
+        try {
+            val conn = connections[ac.device.homeId] ?: run {
+                connectMqtt(_state.value.devices)
+                connections[ac.device.homeId]
+            } ?: error("No cloud connection")
+            if (!conn.isConnected) conn.connect(api.validToken())
+            conn.publishFields(ac.device.topic, fields, ki)
+        } catch (e: Exception) {
+            if (localOnly || !api.isLoggedIn) throw e
+            api.control(ac.device.deviceId, fields, ki)
+        }
+    }
+
+    /**
+     * Sends [commands] in order over the same transport choice as [sendKey]; the raw status is updated
+     * optimistically with every field.
+     */
+    private fun sendCommands(deviceId: String, commands: List<Command>) {
+        if (commands.isEmpty()) return
+        val merged = JSONObject()
+        commands.forEach { c -> c.fields.keys().forEach { k -> merged.put(k, c.fields.get(k)) } }
+        updateDevice(deviceId) { applyStatus(it, merged) }
+        scope.launch {
+            for (c in commands) {
+                val ac = device(deviceId) ?: return@launch
+                try {
+                    sendFieldsNow(ac, c.fields, c.ki)
+                } catch (e: Exception) {
+                    _state.update { it.copy(error = "Send failed: ${e.message}") }
+                    return@launch
+                }
+            }
+        }
+    }
+
+    private suspend fun sendFieldsNow(ac: AcState, fields: JSONObject, ki: Int) {
+        val deviceId = ac.device.deviceId
+        when {
+            demo -> Unit
+            ac.transport == Transport.Local -> try {
+                local.sendFields(deviceId, fields)
+            } catch (e: Exception) {
+                if (localOnly) throw e
+                updateDevice(deviceId) { it.copy(transport = Transport.Cloud) }
+                sendCloudFields(ac, fields, ki)
+            }
+            localOnly -> {
+                if (ac.localKeys == null) error("No LAN keys yet — use \"Refresh keys\" once with internet")
+                runCatching { local.start() }
+                local.register(deviceId, ac.localKeys)
+                local.discover(deviceId) ?: error("${ac.device.name} not found on the local network")
+                updateDevice(deviceId) { it.copy(transport = Transport.Local, online = true) }
+                local.sendFields(deviceId, fields)
+            }
+            else -> sendCloudFields(ac, fields, ki)
+        }
     }
 
     // ---- MQTT -----------------------------------------------------------------------------------
@@ -575,6 +913,7 @@ class AcRepository(context: Context, private val store: SecureStore) {
                     .put("topic", d.device.topic)
                     .put("homeId", d.device.homeId)
                     .put("space", d.device.space)
+                    .put("spaceId", d.device.spaceId)
                     .put("keys", keys)
                     .put("udpSupported", d.udpSupported)
                     .put("model", d.modelJson)
@@ -608,6 +947,7 @@ class AcRepository(context: Context, private val store: SecureStore) {
                         topic = o.getString("topic"),
                         homeId = o.getString("homeId"),
                         space = o.optString("space"),
+                        spaceId = o.optString("spaceId"),
                     ),
                     keys = keys,
                     udpSupported = if (o.isNull("udpSupported")) null else o.optBoolean("udpSupported"),
@@ -627,6 +967,7 @@ class AcRepository(context: Context, private val store: SecureStore) {
 
     private companion object {
         const val KEY_CODE_PREFIX = "miraie-local-v1:"
+        const val NEEDS_SIGN_IN = "Needs MirAIe sign-in"
 
         /** Mac `ACKeys` field names ↔ capabilities. */
         val KEY_CODE_NAMES = listOf(
@@ -665,18 +1006,18 @@ private val DEMO_MODEL = """
  {"capability":"HorizontalSwing","attributes":[{"key":"achs","range":{"increment":[{"value":1}],"max":[{"value":5}],"min":[{"value":0}]}}]},
  {"capability":"PowerStatus","attributes":[{"key":"ps"}]},
  {"capability":"PowerfulMode","attributes":[{"key":"acpm"}]},
- {"capability":"SleepProfile","attributes":[{"key":"acsp"}]},
- {"capability":"TimeBasedFilterHealth","attributes":[{"key":"acfh"}]},
+ {"capability":"SleepProfile","attributes":[{"key":"acsp"},{"key":"duration","range":{"increment":[{"unit":"hours","value":1}],"max":[{"unit":"hours","value":8}],"min":[{"unit":"hours","value":2}]}},{"key":"temps","range":{"increment":[{"unit":"celcius","value":1}],"max":[{"unit":"celcius","value":30}],"min":[{"unit":"celcius","value":16}]}}]},
+ {"capability":"TimeBasedFilterHealth","attributes":[{"key":"acfh","range":{"alert":[{"unit":"hours","value":500}],"reminder":[{"unit":"hours","value":100}],"warning":[{"unit":"hours","value":200}]}}]},
  {"capability":"VerticalSwing","attributes":[{"key":"acvs","range":{"increment":[{"value":1}],"max":[{"value":5}],"min":[{"value":0}]}}]},
  {"capability":"BuzzerControl","attributes":[{"key":"bzr","minFwVersion":3.02,"values":["on","off"]}]}],
- "statusCapabilitiesV2":[{"capability":"ACFaults"},{"capability":"PowerConsumption"}]}
+ "statusCapabilitiesV2":[{"capability":"ACFaults"},{"capability":"PowerConsumption"},{"capability":"PM25Sensor","attributes":[{"key":"PM25Sensor"}]}]}
 """
 
 /** Debug demo status: real keys from user diagnostics (actm is set at seed time). */
 private val DEMO_STATUS = """
 {"V":"3.02","acdc":"on","acec":"off","acem":"off","acfs":"auto","achs":0,"acmd":"cool","acpm":"off","acsp":"none",
  "actmp":"26.0","acvs":0,"bzr":"on","cnv":0,"errors":"","warnings":"","filterCleaningRequired":true,"filterDustLevel":2,
- "onlineStatus":"true","ps":"on","rmtmp":"32.0","rssi":-56,"ty":"AC"}
+ "onlineStatus":"true","ps":"on","rmtmp":"32.0","rssi":-56,"ty":"AC","totalOperatingHours":230,"PM25Sensor":"48"}
 """
 
 /** Official temperature format (`DecimalFormat("#.0")`): "26.0", "24.5". */

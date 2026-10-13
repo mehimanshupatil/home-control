@@ -57,6 +57,7 @@ class MiraieApi(private val store: SecureStore) {
             for (s in 0 until spaces.length()) {
                 val space = spaces.getJSONObject(s)
                 val spaceName = space.optString("spaceName")
+                val spaceId = space.optString("spaceId")
                 val ds = space.optJSONArray("devices") ?: continue
                 for (d in 0 until ds.length()) {
                     val dev = ds.getJSONObject(d)
@@ -71,10 +72,13 @@ class MiraieApi(private val store: SecureStore) {
                         topic = topic,
                         homeId = homeId,
                         space = spaceName,
+                        spaceId = spaceId,
                     )
                 }
             }
-            Home(homeId, h.optString("homeName", "Home"), devices)
+            val spaceList = (0 until spaces.length()).mapNotNull { spaces.optJSONObject(it) }
+                .map { Space(it.optString("spaceId"), it.optString("spaceName")) }
+            Home(homeId, h.optString("homeName", "Home"), devices, spaceList)
         }
     }
 
@@ -117,6 +121,89 @@ class MiraieApi(private val store: SecureStore) {
     suspend fun status(deviceId: String): JSONObject =
         JSONObject(authedGet(API_BASE + "deviceManagement/devices/$deviceId/mobile/status"))
 
+    // ---- cloud features (docs/FEATURES.md) -----------------------------------------------------------
+
+    /** `GET powerConsumption/devices/{id}?grain&startDate&endDate` → `[{day|week|month, power}]`. */
+    suspend fun energy(deviceId: String, window: EnergyWindow): JSONArray =
+        JSONArray(authedGet(API_BASE + "powerConsumption/devices/$deviceId?grain=${window.grain.api}&startDate=${window.startDate}&endDate=${window.endDate}"))
+
+    private fun sleepPath(d: MiraieDevice) =
+        API_BASE + "homeManagement/homes/${d.homeId}/spaces/${d.spaceId}/devices/${d.deviceId}/sleepProfile"
+
+    suspend fun sleepProfiles(d: MiraieDevice): List<SleepProfile> {
+        val arr = JSONArray(authedGet(sleepPath(d)))
+        return (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }.map(SleepProfile::fromJson)
+    }
+
+    suspend fun createSleepProfile(d: MiraieDevice, p: SleepProfile): SleepProfile =
+        SleepProfile.fromJson(JSONObject(authed("POST", sleepPath(d), p.createBody()).ifEmpty { "{}" })).let { r -> if (r.id == null) p else r }
+
+    suspend fun updateSleepProfile(d: MiraieDevice, p: SleepProfile): SleepProfile =
+        SleepProfile.fromJson(JSONObject(authed("PUT", sleepPath(d) + "/${p.id}", p.updateBody()).ifEmpty { "{}" })).let { r -> if (r.id == null) p else r }
+
+    suspend fun deleteSleepProfile(d: MiraieDevice, profileId: String) {
+        authed("DELETE", sleepPath(d) + "/$profileId", null)
+    }
+
+    /** `POST rms/homes/{h}/rules` → `{status, ruleId}`. */
+    suspend fun createRule(homeId: String, body: JSONObject): String =
+        JSONObject(authed("POST", API_BASE + "rms/homes/$homeId/rules", body)).optString("ruleId")
+
+    suspend fun updateRule(homeId: String, ruleId: String, body: JSONObject): String =
+        JSONObject(authed("PUT", API_BASE + "rms/homes/$homeId/rules/$ruleId", body).ifEmpty { "{}" }).optString("ruleId").ifEmpty { ruleId }
+
+    suspend fun rule(homeId: String, ruleId: String): JSONObject =
+        JSONObject(authedGet(API_BASE + "rms/homes/$homeId/rules/$ruleId"))
+
+    suspend fun deleteRule(homeId: String, ruleId: String) {
+        authed("DELETE", API_BASE + "rms/homes/$homeId/rules/$ruleId", null)
+    }
+
+    suspend fun pauseRule(homeId: String, body: JSONArray) {
+        authed("PUT", API_BASE + "rms/homes/$homeId/rules/pause", body)
+    }
+
+    suspend fun resumeRule(homeId: String, ruleId: String) {
+        authed("PUT", API_BASE + "rms/homes/$homeId/rules/resume", JSONArray().put(ruleId))
+    }
+
+    /** Time-based filter reset (`PUT deviceManagement/devices/{id}/filterDustLevelInfo`, no body). */
+    suspend fun resetFilter(deviceId: String) {
+        authed("PUT", API_BASE + "deviceManagement/devices/$deviceId/filterDustLevelInfo", null)
+    }
+
+    /**
+     * REST control, exactly as `GeofenceBroadcastReceiver` sends it: `POST deviceManagement/control`
+     * `{deviceId, control_params:{...fields, "cnt":"gva", "ki":N, "sid":"11"}}`. Only `ps` is observed in the
+     * official app; other keys through this endpoint are unverified.
+     */
+    suspend fun control(deviceId: String, fields: JSONObject, ki: Int) {
+        val params = JSONObject(fields.toString())
+        if (ki >= 0) params.put("ki", ki)
+        params.put("cnt", "gva").put("sid", "11")
+        authed("POST", API_BASE + "deviceManagement/control", JSONObject().put("deviceId", deviceId).put("control_params", params))
+    }
+
+    suspend fun renameDevice(d: MiraieDevice, name: String) {
+        authed("PUT", API_BASE + "homeManagement/homes/${d.homeId}/spaces/${d.spaceId}/devices/${d.deviceId}", JSONObject().put("deviceName", name))
+    }
+
+    suspend fun moveDevice(d: MiraieDevice, newSpaceId: String) {
+        authed("POST", API_BASE + "homeManagement/homes/${d.homeId}/spaces/${d.spaceId}/devices/${d.deviceId}", JSONObject().put("newSpaceId", newSpaceId))
+    }
+
+    suspend fun firmware(deviceId: String, currentVersion: String): FirmwareInfo =
+        FirmwareInfo.fromJson(JSONObject(authedGet(API_BASE + "fota/firmware/deviceId/$deviceId/download?currentVersion=" + java.net.URLEncoder.encode(currentVersion, "UTF-8"))))
+
+    /** `notificationmanager/log?severity&pgIndex&pgSize` (pages start at 1). */
+    suspend fun notifications(severity: String, page: Int, pageSize: Int = 20): List<AcNotification> {
+        val arr = JSONArray(authedGet(API_BASE + "notificationmanager/log?severity=$severity&pgIndex=$page&pgSize=$pageSize"))
+        return (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }.map(AcNotification::fromJson)
+    }
+
+    suspend fun unreadAlerts(): Int =
+        JSONObject(authedGet(API_BASE + "notificationmanager/unexpired/count?severity=alert")).optInt("unexpired", 0)
+
     /** Returns a valid access token, refreshing or re-logging in when it has expired. */
     suspend fun validToken(): String = authMutex.withLock {
         val token = store.accessToken
@@ -149,6 +236,20 @@ class MiraieApi(private val store: SecureStore) {
         } catch (e: MiraieException) {
             if (e.code != 401) throw e
             get(url, forceRenew())
+        }
+    }
+
+    /** Authenticated POST/PUT/DELETE with a JSON body (object or array), retrying once after a 401. */
+    private suspend fun authed(method: String, url: String, body: Any?): String {
+        suspend fun call(token: String) = withContext(Dispatchers.IO) {
+            val rb = (body?.toString() ?: if (method == "DELETE") null else "").let { it?.toRequestBody(JSON) }
+            execute(Request.Builder().url(url).header("Authorization", "Bearer $token").method(method, rb).build())
+        }
+        return try {
+            call(validToken())
+        } catch (e: MiraieException) {
+            if (e.code != 401) throw e
+            call(forceRenew())
         }
     }
 

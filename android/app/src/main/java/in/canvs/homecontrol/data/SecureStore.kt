@@ -66,6 +66,16 @@ class SecureStore(context: Context) {
 
     fun clearMiraie() = secure.edit { clear() }
 
+    /** Local WiZ rooms (JSON array). */
+    var wizRooms: String?
+        get() = plain.getString("wiz_rooms", null)
+        set(v) = plain.edit { putString("wiz_rooms", v) }
+
+    /** Saved WiZ light presets (JSON array). */
+    var wizPresets: String?
+        get() = plain.getString("wiz_presets", null)
+        set(v) = plain.edit { putString("wiz_presets", v) }
+
     fun bulbName(mac: String): String? = plain.getString("bulb_name_$mac", null)
 
     fun setBulbName(mac: String, name: String) =

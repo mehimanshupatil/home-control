@@ -38,7 +38,21 @@ The device model's `controlCapabilities` / `statusCapabilitiesV2` are parsed int
 - **Profiles** are stored per AC in UserDefaults (`acProfiles-<deviceId>`). Applying one sends only the settings that differ, as separate commands about 300 ms apart: power first when turning on, and only power when the profile turns the AC off.
 - **Try local control (experimental):** off by default. When on, the app fetches LAN keys and runs discovery even for models without `udpControl`. Diagnostics record `lanKeyAvailable` and `lastLocalDiscovery`.
 
+## Cloud features (Mac; Android pending)
+
+`ACCloud.swift` holds the cloud-only features and their pure payload builders (checked by the snapshot harness):
+energy windows (`EnergyWindow`, PROTOCOL.md §1.9), sleep profiles and schedules (`SleepProfile`, `SleepSchedule`, §1.10–1.11),
+filter reset (§1.12), rename/move, firmware check and notifications (§1.13). `ACCloudViews.swift` renders them as panels on the
+AC card (Energy, Sleep, Filter, Settings) plus a notifications card. Every cloud panel shows a "MirAIe cloud" caption; when
+there's no session, or Local network only is on, it shows `ACStore.cloudBlocker` instead of erroring.
+
+Commands go through `ACStore.sendFields`, which adds the envelope per transport: LAN (`ki 1`), MQTT (`ki n`, `cnt an`), or, when
+MQTT isn't connected, REST `deviceManagement/control` (`cnt gva`, `sid 11`). Toggles go through `setToggle`, which reproduces the
+official side effects (§1.14).
+
 ## WiZ
+
+Rooms (`LightGroup`) and presets (`LightPreset`, one `PilotState` per bulb) are stored locally in UserDefaults (`wizGroups`, `wizPresets`); group actions fan out `setPilot` per bulb. Identify sends `pulse` and falls back to an off/on blink when the bulb doesn't confirm within 1 s.
 
 Stateless UDP JSON-RPC. Discovery broadcasts `getPilot` and collects replies keyed by MAC; control is `setPilot` to the bulb's IP with retries. Names are stored locally (bulbs don't carry the WiZ app's names). Identify blinks the bulb using `setPilot` only.
 
@@ -63,10 +77,11 @@ Stateless UDP JSON-RPC. Discovery broadcasts `getPilot` and collects replies key
 | `LocalACTransport.swift` | UDP 5001 discovery, AES-CBC (CommonCrypto), status receive |
 | `Capabilities.swift`, `JSONValue.swift` | Model capability parsing; Codable JSON for raw model and status |
 | `ACViews.swift`, `ACExtras.swift` | AC cards, login, key-code import, keys card, More controls, info chips, diagnostics |
-| `LightsStore.swift`, `WizUDP.swift`, `LightsViews.swift` | WiZ state, UDP JSON-RPC, bulb cards |
+| `LightsStore.swift`, `WizUDP.swift`, `LightsViews.swift` | WiZ state, UDP JSON-RPC, bulb cards, local rooms and presets |
 | `Theme.swift` | Design tokens and shared components (card, tiles, pills, press style, transitions) |
 | `Keychain.swift`, `StateCompat.swift` | Keychain wrapper; `@ViewState` alias (see AGENTS.md) |
-| `Snapshot.swift` | DEBUG-only renderer to PNG plus self-checks (key round trip, diagnostics redaction, model parsing, timer payload). Runs with sample data and never touches the real session. |
+| `ACCloud.swift`, `ACCloudViews.swift` | Cloud features (energy, sleep profiles + schedules, filter, rename/move, firmware, notifications) and their card panels |
+| `Snapshot.swift` | DEBUG-only renderer to PNG plus self-checks (key round trip, redaction, model parsing, timer, sleep/rule/energy payloads, side effects). Runs with sample data and never touches the real session, cloud or LAN. |
 
 ### android/ (single module `app`, package `in.canvs.homecontrol`)
 | File | Role |

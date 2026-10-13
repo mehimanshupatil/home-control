@@ -64,12 +64,14 @@ class MiraieMqtt(
     }
 
     /** Publishes one control field to `<topic>/control` using the app's envelope (`ki`, `cnt`, `sid`). */
-    fun publishControl(topic: String, key: String, value: Any, ki: Int) {
-        val payload = JSONObject()
-            .put(key, value)
-            .put("ki", ki)
-            .put("cnt", "an")
-            .put("sid", "1")
+    fun publishControl(topic: String, key: String, value: Any, ki: Int) =
+        publishFields(topic, JSONObject().put(key, value), ki)
+
+    /** Publishes [fields] plus the envelope; `ki` is omitted when negative (e.g. nanoe GA, as the official app). */
+    fun publishFields(topic: String, fields: JSONObject, ki: Int) {
+        val payload = JSONObject(fields.toString())
+        if (ki >= 0) payload.put("ki", ki)
+        payload.put("cnt", "an").put("sid", "1")
         client.publish("$topic/control", MqttMessage(payload.toString().toByteArray()).apply {
             qos = 0
             isRetained = false

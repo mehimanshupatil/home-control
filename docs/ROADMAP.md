@@ -11,20 +11,24 @@
   - Swing is locked while Clean runs.
   - Local profiles: save, apply and delete.
   - Experimental "Try local control" for models without `udpControl`; diagnostics report `lanKeyAvailable` and `lastLocalDiscovery`.
+- Both apps, from the full feature inventory (docs/FEATURES.md):
+  - Official side effects: power-on 24°, ECO 26°, Powerful/JetStream turn Convertible off, JetStream/Turbo swing 1, profile reset (PROTOCOL.md §1.14).
+  - Energy chart (Day / Week / Month kWh), cloud sleep profiles (create, edit, delete, start, stop) and their schedules (rms rules, pause/resume).
+  - Filter health bar and reset (time-based and dust-based), PM2.5 band chip, JetStream / EcoNavi / Humidifier / Laundry toggles, nanoe GA cycle.
+  - REST control fallback when MQTT is down; rename and move-room; firmware update check; notification history with unread count.
+  - WiZ: `pulse` identify (blink fallback), scenes 33 and 35, local rooms with group power / brightness / scene, saved light presets.
 
 ## Next
-1. **Test on the real AC:** that a timer set from the app appears in `actm` and fires, and that profiles apply cleanly over MQTT.
+1. **Test on the real AC:** timer in `actm`, profiles over MQTT, sleep-profile start/stop and schedule, energy data, filter reset, REST fallback for non-power keys.
 2. **Try local control (experimental):** report whether the AC answers `DISC_REQ` even though model 130185 lacks `udpControl`.
-3. **Sleep profile (`acsp`):** status shows `"none"`; the payload needs a cloud profile id (`pid`), so it's not built.
-4. **Intesis / Comfort Cloud bridged ACs:** these use the `/tcontrol` MQTT topic, which isn't handled yet.
-5. **ECO sets 26°:** the official app sets 26° when ECO turns on; decide whether to mirror it.
+3. **Intesis / Comfort Cloud bridged ACs:** these use the `/tcontrol` MQTT topic, which isn't handled yet.
 
 ## Later
 - WiZ fade-in/out and startup mode (needs `getUserConfig`/`setUserConfig` shapes confirmed on a bulb).
 - Local schedules for lights.
 - Mac: show the selected AC's temperature in the menu bar label.
 - Android: home-screen widget.
-- Power-consumption history (cloud only: `powerConsumption/homes/{homeId}`).
+- Proximity (geofence) prompts, cloud scenes/routines, AI Mode (see docs/FEATURES.md "Later").
 
 ## Unverified assumptions
 | Assumption | Where it matters |
@@ -34,3 +38,6 @@
 | AC devices are identified by `category` | Device filtering (falls back to showing all devices) |
 | LAN key/IV are stable until the AC is re-paired | Key-code usefulness |
 | WiZ scene grouping (White/Colors/Moving) | Scene menu only |
+| REST control accepts keys other than `ps` (only power is seen in the app) | Cloud fallback when MQTT is down |
+| WiZ `pulse` params `delta: -60, duration: 800` and a `{"result":{"success":true}}` reply | Identify (falls back to blinking) |
+| Energy `power` values are kWh per bucket | Energy chart totals |

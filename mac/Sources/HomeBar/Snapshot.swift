@@ -73,6 +73,10 @@ enum Snapshot {
             window.appearance = NSAppearance(named: appearance)
             window.contentView = host
             host.layoutSubtreeIfNeeded()
+            RunLoop.main.run(until: Date().addingTimeInterval(0.4)) // let `.task` loaders finish
+            host.frame = NSRect(origin: .zero, size: host.fittingSize)
+            window.setContentSize(host.frame.size)
+            host.layoutSubtreeIfNeeded()
             guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { continue }
             host.cacheDisplay(in: host.bounds, to: rep)
             let url = URL(fileURLWithPath: dir).appendingPathComponent("\(name)-\(mode).png")
@@ -97,6 +101,20 @@ enum Snapshot {
             render(ACCard(device: ac.devices[0]), name: "ac-clean", dir: dir, ac: ac, lights: lights)
         }
         render(ACDiagnosticsCard {}, name: "diagnostics", dir: dir, ac: ac, lights: lights)
+        ACCard.debugExpandMore = false
+        for panel in ACPanel.allCases {
+            ACCard.debugPanel = panel
+            render(ACCard(device: ac.devices[0]), name: "ac-panel-\(panel.rawValue)", dir: dir, ac: ac, lights: lights)
+        }
+        ACCard.debugPanel = .filter
+        render(ACCard(device: ac.devices[2]), name: "ac-panel-filter-dust", dir: dir, ac: ac, lights: lights)
+        ACCard.debugPanel = nil
+        ACCard.debugExpandMore = true
+        render(ACCard(device: ac.devices[2]), name: "ac-rich", dir: dir, ac: ac, lights: lights)
+        ACCard.debugExpandMore = false
+        render(ACNotificationsCard {}, name: "notifications", dir: dir, ac: ac, lights: lights)
+        BulbCard.debugExpandFirst = false
+        render(LightsSection(), name: "lights-rooms", dir: dir, ac: ac, lights: lights)
         render(BulbCard(bulb: lights.bulbs[0]), name: "bulb-scene", dir: dir, ac: ac, lights: lights)
     }
 
@@ -118,6 +136,8 @@ enum Snapshot {
         print("diagnostics has model + status:", json.contains("controlCapabilities") && json.contains("\"acdc\""))
         print("diagnostics has local fields:", json.contains("lanKeyAvailable") && json.contains("lastLocalDiscovery"))
         checkModelParsing(ac)
+        checkCloudPayloads()
+        checkSideEffects()
     }
 
     /// Model 130185 must drive the core controls (no Heat, 1° steps, Convertible from intValues).
@@ -152,6 +172,101 @@ enum Snapshot {
         let offOK = sent.count == 2 && abs(sent[0] - (now + 7200)) < 5
         let onOK = sent.count == 2 && abs(sent[1] - (now + 3600)) < 5
         print("timer optimistic status (UTC) keeps off + sets on:", offOK && onOK ? "PASS" : "FAIL \(sent)")
+    }
+
+    private static func report(_ name: String, _ ok: Bool, _ detail: Any = "") {
+        print("\(name):", ok ? "PASS" : "FAIL \(detail)")
+    }
+
+    /// Sleep-profile, rule and energy payloads must match the official app's formats.
+    private static func checkCloudPayloads() {
+        // Sleep profile formatting (SleepProfileEntity) and activation (ACProfileCapability.buildMessage).
+        let p = SleepProfile(id: "p9", name: "Cool night", temps: [26, 27, 28.5], offAtEnd: true)
+        report("sleep temperatures %04.1f + off", p.temperatureStrings == ["26.0", "27.0", "28.5", "00.0"], p.temperatureStrings)
+        let f = p.activationFields(key: "acsp", on: true)
+        report("sleep activation fields", f["acsp"] as? String == "on" && f["pid"] as? String == "p9"
+               && (f["temps"] as? [String]) == p.temperatureStrings, f)
+        let def = SleepProfile(id: "x", name: "default", temps: [26], offAtEnd: false)
+        report("default profile pid", def.activationFields(key: "acsp", on: false)["pid"] as? String == "default")
+        let parsed = SleepProfile(entity: ["profileId": "p9", "profileName": "N", "temperatures": ["26.0", "27.0", "00.0"], "smartRuleId": ["r1"]])
+        report("sleep entity parse (trailing 00.0 = off at end)", parsed?.temps == [26, 27] && parsed?.offAtEnd == true && parsed?.ruleIds == ["r1"])
+        report("rule payload string", p.rulePayloadString(key: "acsp", ki: 12) == #"{"acsp":"on","ki":12,"pid":"p9"}"#,
+               p.rulePayloadString(key: "acsp", ki: 12))
+
+        // Rule (RuleItem.getRulePayload) shape.
+        let body = SleepSchedule.rulePayload(name: "Schedule Cool night", homeId: "h", userId: "u", deviceId: "d1", profile: p,
+                                             payload: p.rulePayloadString(key: "acsp", ki: 12), hour: 22, minute: 30, weekdays: [1, 2])
+        let trig = ((body["triggers"] as? [[[String: Any]]])?.first?.first) ?? [:]
+        let action = (((body["rule"] as? [String: Any])?["actions"]) as? [[String: Any]])?.first ?? [:]
+        report("rule trigger", trig["type"] as? String == "Timer" && trig["check"] as? String == "EQ"
+               && trig["property"] as? String == "Time" && trig["value"] as? Int == 2230 && trig["repeatType"] as? String == "S,M", trig)
+        report("rule action", action["deviceId"] as? String == "d1" && action["profileId"] as? String == "p9"
+               && action["payloadVersion"] as? String == "0.1" && (action["payload"] as? String)?.contains("\"pid\":\"p9\"") == true, action)
+        report("rule header", body["schemaVersion"] as? String == "v2" && body["ruleType"] as? String == "User"
+               && body["ruleStatus"] as? String == "ENABLE" && body["primaryUserId"] as? String == "u" && body["ruleId"] == nil)
+        let all = SleepSchedule(ruleId: "", hour: 0, minute: 0, weekdays: Set(1...7), enabled: true)
+        let once = SleepSchedule(ruleId: "", hour: 0, minute: 0, weekdays: [], enabled: true)
+        report("rule repeatType daily/once/parse", all.repeatType == "daily" && once.repeatType == "once"
+               && SleepSchedule.weekdays(from: "S,TH,SA") == [1, 5, 7])
+        let back = SleepSchedule(ruleId: "r", rule: ["ruleStatus": "PAUSE", "triggers": [[["value": 615, "repeatType": "M,W"]]]])
+        report("rule parse", back?.hour == 6 && back?.minute == 15 && back?.weekdays == [2, 4] && back?.enabled == false)
+
+        // Energy windows (DayHelper): ddMMyyyy / MMyyyy, zero-filled buckets.
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "Asia/Kolkata")!
+        let now = cal.date(from: DateComponents(year: 2026, month: 10, day: 13, hour: 15))!
+        let d = EnergyWindow.make(.daily, now: now, calendar: cal)
+        let w = EnergyWindow.make(.weekly, now: now, calendar: cal)
+        let m = EnergyWindow.make(.monthly, now: now, calendar: cal)
+        report("energy daily window", d.startDate == "07102026" && d.endDate == "13102026" && d.buckets.count == 7, (d.startDate, d.endDate))
+        report("energy weekly window", w.startDate == "26082026" && w.endDate == "07102026" && w.buckets.count == 7, (w.startDate, w.endDate))
+        report("energy monthly window", m.startDate == "042026" && m.endDate == "102026" && m.buckets.count == 7, (m.startDate, m.endDate))
+        let pts = d.points(from: [["day": "09102026", "power": "4.25"], ["day": "13102026", "power": 1.5]])
+        report("energy zero-fill", pts.map(\.kWh) == [0, 0, 4.25, 0, 0, 0, 1.5], pts.map(\.kWh))
+    }
+
+    /// Official side effects (ACDevice.setPowerStatus / setEcoMode / setACPowerfulMode / setACJetStreamMode).
+    private static func checkSideEffects() {
+        let ac = ACStore()
+        ac.seedDemo()
+        func keys() -> [String] {
+            ac.sentLog.map { f in f.keys.filter { !["pid", "temps"].contains($0) }.sorted().map { "\($0)=\(f[$0]!)" }.joined(separator: ",") }
+        }
+        // Power on from 20° in cool → also 24°.
+        if let i = ac.devices.firstIndex(where: { $0.id == "d1" }) {
+            ac.devices[i].state.power = false
+            ac.devices[i].state.setTemp = 20
+            ac.sentLog = []
+            ac.setPower(ac.devices[i], true)
+            report("power on raises to 24°", keys().prefix(2) == ["ps=on", "actmp=24.0"], keys())
+        }
+        // ECO on → 26°.
+        let d1 = ac.devices[0]
+        if let eco = d1.capability("ECOMode") {
+            ac.sentLog = []
+            ac.setToggle(d1, eco, true)
+            report("ECO on sets 26°", keys().prefix(2) == ["acem=on", "actmp=26.0"], keys())
+        }
+        // Powerful on → Convertible off first.
+        if let pm = d1.capability("PowerfulMode") {
+            ac.sentLog = []
+            ac.setToggle(ac.devices[0], pm, true)
+            report("Powerful turns Convertible off first", keys() == ["cnv=0", "acpm=on"], keys())
+        }
+        // JetStream on (rich model) → Convertible off, jet on, swings 1, running custom profile stopped.
+        let d3 = ac.devices[2]
+        if let jet = d3.capability("JetStream") {
+            ac.sentLog = []
+            ac.setToggle(d3, jet, true)
+            report("JetStream side effects", keys() == ["cnv=0", "acjs=on", "acvs=1", "achs=1", "acsp=off"], keys())
+        }
+        // Mode change stops a running custom profile.
+        if let i = ac.devices.firstIndex(where: { $0.id == "d3" }) {
+            ac.devices[i].state.raw["acsp"] = .string("p1")
+            ac.sentLog = []
+            ac.setMode(ac.devices[i], "dry")
+            report("mode change stops sleep profile", keys() == ["acmd=dry", "acsp=off"], keys())
+        }
     }
 
     private static func renderKeysCard(dir: String) {

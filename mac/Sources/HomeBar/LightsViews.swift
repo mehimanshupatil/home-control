@@ -28,10 +28,170 @@ struct LightsSection: View {
                 ) { Task { await lights.discover() } }
             }
 
-            ForEach(lights.bulbs) { bulb in
+            if !lights.presets.isEmpty {
+                LightPresetsRow()
+            }
+
+            ForEach(lights.groups) { g in
+                LightRoomSection(group: g)
+            }
+
+            let others = lights.ungrouped
+            if !others.isEmpty {
+                if !lights.groups.isEmpty {
+                    Text("Other lights").font(.caption.weight(.semibold)).foregroundStyle(.secondary).padding(.top, 2)
+                }
+                ForEach(others) { bulb in
+                    BulbCard(bulb: bulb)
+                }
+            }
+
+            if !lights.bulbs.isEmpty {
+                NewRoomButton()
+            }
+        }
+    }
+}
+
+/// Saved presets as chips: click to apply, right-click to delete.
+struct LightPresetsRow: View {
+    @EnvironmentObject private var lights: LightsStore
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "sparkles").font(.caption).foregroundStyle(.secondary).frame(width: 16).accessibilityHidden(true)
+            FlowLayout(spacing: 6) {
+                ForEach(lights.presets) { p in
+                    Button { lights.applyPreset(p) } label: {
+                        Text(p.name)
+                            .font(.caption.weight(.medium))
+                            .padding(.horizontal, 10)
+                            .frame(height: 24)
+                            .background(Capsule().fill(Color.primary.opacity(0.08)))
+                    }
+                    .buttonStyle(.pressable)
+                    .help("Apply “\(p.name)” to \(p.entries.count) light\(p.entries.count == 1 ? "" : "s") — right-click to delete")
+                    .contextMenu {
+                        Button("Delete “\(p.name)”", role: .destructive) { lights.deletePreset(p) }
+                    }
+                    .accessibilityLabel("Apply preset \(p.name)")
+                }
+            }
+        }
+    }
+}
+
+/// A room header with group power, brightness and scene, followed by its bulbs.
+struct LightRoomSection: View {
+    @EnvironmentObject private var lights: LightsStore
+    let group: LightGroup
+    @ViewState private var dimming: Double = 80
+    @ViewState private var renaming = false
+    @ViewState private var savingPreset = false
+    @ViewState private var draft = ""
+
+    var body: some View {
+        let members = lights.members(group)
+        let anyOn = members.contains { $0.on }
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                if renaming || savingPreset {
+                    TextField(renaming ? "Room name" : "Preset name", text: $draft)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit(commit)
+                        .onExitCommand { renaming = false; savingPreset = false }
+                    Button("Save", action: commit).font(.caption.weight(.semibold))
+                } else {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(group.name).font(.subheadline.weight(.semibold))
+                        Text("\(members.filter(\.on).count) of \(members.count) on").font(.caption2).foregroundStyle(.secondary).monospacedDigit()
+                    }
+                    Spacer()
+                    Menu {
+                        ForEach(LightsStore.sceneGroups, id: \.title) { sg in
+                            Section(sg.title) {
+                                ForEach(sg.ids, id: \.self) { id in
+                                    Button(LightsStore.sceneName(id) ?? "Scene \(id)") { lights.setGroupScene(group, id) }
+                                }
+                            }
+                        }
+                    } label: { Text("Scene").font(.caption.weight(.medium)) }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                    .disabled(members.isEmpty)
+                    Menu {
+                        Button("Save as preset…") { draft = group.name; savingPreset = true }.disabled(members.isEmpty)
+                        Button("Rename room…") { draft = group.name; renaming = true }
+                        Divider()
+                        Button("Delete room", role: .destructive) { lights.deleteGroup(group) }
+                    } label: { Image(systemName: "ellipsis.circle") }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .accessibilityLabel("\(group.name) options")
+                    PowerButton(isOn: anyOn, tint: .orange, label: "\(group.name) lights") { lights.setGroupOn(group, !anyOn) }
+                        .disabled(members.isEmpty)
+                }
+            }
+            if !members.isEmpty {
+                HStack(spacing: 8) {
+                    Image(systemName: "sun.min").accessibilityHidden(true)
+                    Slider(value: $dimming, in: 10...100) { editing in
+                        if !editing { lights.setGroupDimming(group, Int(dimming)) }
+                    }
+                    .accessibilityLabel("\(group.name) brightness")
+                    Text("\(Int(dimming))%").monospacedDigit().frame(width: 36, alignment: .trailing)
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            } else {
+                Text("No lights yet — open a bulb's options and choose this room.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            ForEach(members) { bulb in
                 BulbCard(bulb: bulb)
             }
         }
+        .onAppear {
+            let on = members.filter(\.on)
+            if !on.isEmpty { dimming = Double(on.map(\.dimming).reduce(0, +) / on.count) }
+        }
+    }
+
+    private func commit() {
+        if renaming { lights.renameGroup(group, draft) }
+        if savingPreset { lights.savePreset(draft, bulbs: lights.members(group)) }
+        renaming = false
+        savingPreset = false
+    }
+}
+
+struct NewRoomButton: View {
+    @EnvironmentObject private var lights: LightsStore
+    @ViewState private var editing = false
+    @ViewState private var name = ""
+
+    var body: some View {
+        if editing {
+            HStack(spacing: 6) {
+                TextField("Room name (e.g. Bedroom)", text: $name)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit(save)
+                    .onExitCommand { editing = false }
+                Button("Cancel") { editing = false }.buttonStyle(.borderless).font(.caption)
+                Button("Add", action: save).font(.caption.weight(.semibold)).disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        } else {
+            Button { name = ""; editing = true } label: {
+                Label("New room", systemImage: "plus").font(.caption.weight(.medium))
+            }
+            .buttonStyle(.borderless)
+        }
+    }
+
+    private func save() {
+        lights.createGroup(name)
+        editing = false
     }
 }
 
@@ -73,6 +233,8 @@ struct BulbCard: View {
     @ViewState private var kelvin: Double = 4000
     @ViewState private var speed: Double = 100
     @ViewState private var color: Color = .white
+    @ViewState private var savingPreset = false
+    @ViewState private var presetName = ""
 
     private static let swatches: [(Int, Int, Int)] = [
         (255, 59, 48), (255, 149, 0), (255, 214, 10), (52, 199, 89), (0, 199, 190), (10, 132, 255), (175, 82, 222), (255, 45, 85),
@@ -237,13 +399,43 @@ struct BulbCard: View {
                 .foregroundStyle(.secondary)
             }
 
+            if !lights.groups.isEmpty {
+                HStack {
+                    Text("Room").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    Spacer()
+                    Picker("Room", selection: Binding(get: { lights.group(of: bulb)?.id }, set: { id in
+                        lights.assign(bulb, to: lights.groups.first { $0.id == id })
+                    })) {
+                        Text("None").tag(UUID?.none)
+                        ForEach(lights.groups) { Text($0.name).tag(UUID?.some($0.id)) }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .fixedSize()
+                }
+            }
+
+            if savingPreset {
+                HStack(spacing: 6) {
+                    TextField("Preset name", text: $presetName)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit(savePreset)
+                        .onExitCommand { savingPreset = false }
+                    Button("Save", action: savePreset).font(.caption.weight(.semibold))
+                }
+            }
+
             HStack(spacing: 12) {
                 Text(bulb.ip).font(.caption2).foregroundStyle(.tertiary).monospacedDigit()
                 Spacer()
+                Button("Save preset") { presetName = bulb.name; savingPreset = true }
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+                    .help("Save this light's current colour, brightness and scene")
                 Button("Identify") { lights.identify(bulb) }
                     .buttonStyle(.borderless)
                     .font(.caption)
-                    .help("Blink this bulb twice")
+                    .help("Pulse this bulb so you can spot it")
                 Button("Rename", action: startRename)
                     .buttonStyle(.borderless)
                     .font(.caption)
@@ -291,6 +483,11 @@ struct BulbCard: View {
             detail += " · \(t)K"
         }
         return detail
+    }
+
+    private func savePreset() {
+        lights.savePreset(presetName, bulbs: [bulb])
+        savingPreset = false
     }
 
     private func startRename() {

@@ -110,6 +110,7 @@ struct SettingsMenu: View {
     @EnvironmentObject private var ac: ACStore
     @AppStorage("showACKeys") private var showACKeys = false
     @AppStorage("showACDiagnostics") private var showDiagnostics = false
+    @AppStorage("showACNotifications") private var showNotifications = false
     @ViewState private var launchAtLogin = SMAppService.mainApp.status == .enabled
 
     var body: some View {
@@ -126,6 +127,10 @@ struct SettingsMenu: View {
                     }
                 }
                 .disabled(ac.exportableDevices.isEmpty)
+                Button(ac.unreadAlerts > 0 ? "AC Notifications (\(ac.unreadAlerts) new)…" : "AC Notifications…") {
+                    showNotifications = true
+                    UserDefaults.standard.set(HomeTab.climate.rawValue, forKey: "selectedTab")
+                }
                 Button("AC Diagnostics…") {
                     showDiagnostics = true
                     UserDefaults.standard.set(HomeTab.climate.rawValue, forKey: "selectedTab")
