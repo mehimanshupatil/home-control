@@ -117,6 +117,7 @@ struct SettingsMenu: View {
             Toggle("Launch at Login", isOn: Binding(get: { launchAtLogin }, set: setLaunchAtLogin))
             if ac.loggedIn {
                 Toggle("AC: Local Network Only", isOn: $ac.localOnly)
+                Toggle("Try Local Control (Experimental)", isOn: $ac.tryLocal)
                 Toggle("Show AC Keys", isOn: $showACKeys)
                 Button("Copy AC Key Code") {
                     if let code = ac.exportKeyCode() {

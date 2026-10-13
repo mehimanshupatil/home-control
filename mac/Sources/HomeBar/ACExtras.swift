@@ -39,41 +39,69 @@ struct FlowLayout: Layout {
 
 // MARK: Info row
 
-/// Read-only status chips: humidity, filter, PM2.5, power and faults. Only values the AC reports.
+/// Read-only status chips from the keys real ACs report (PROTOCOL.md §1.8): Wi-Fi signal,
+/// filter, errors and warnings, plus humidity / PM2.5 / power when the model declares them.
 struct ACInfoRow: View {
     let device: ACDevice
+
+    private enum Style { case plain, warning, fault }
 
     private struct Item: Identifiable {
         let id: String
         let text: String
         let symbol: String
-        var isFault = false
+        var style: Style = .plain
+        var help: String? = nil
+        var signal: Double? = nil
     }
 
     private var items: [Item] {
-        let caps = device.capabilities
         let raw = device.state.raw
-        func value(_ name: String) -> JSONValue? {
-            guard let cap = caps.first(where: { $0.name == name }) else { return nil }
+        func declared(_ name: String) -> JSONValue? {
+            guard let cap = device.capability(name), cap.key != name else { return nil }
             return raw[cap.key]
         }
+        func text(_ key: String) -> String {
+            raw[key]?.stringValue?.trimmingCharacters(in: .whitespaces) ?? ""
+        }
         var out: [Item] = []
-        if let h = value("RoomHumidity")?.doubleValue {
+        if let rssi = raw["rssi"]?.doubleValue, rssi < 0 {
+            let bars = rssi >= -55 ? 3.0 : rssi >= -67 ? 2 : rssi >= -80 ? 1 : 0
+            let word = ["Weak", "Weak", "Fair", "Good"][Int(bars)]
+            out.append(Item(id: "rssi", text: "Wi-Fi \(word.lowercased())", symbol: "wifi",
+                            help: String(format: "Wi-Fi signal %.0f dBm", rssi), signal: bars / 3))
+        }
+        if let h = declared("RoomHumidity")?.doubleValue {
             out.append(Item(id: "hum", text: String(format: "Humidity %.0f%%", h), symbol: "humidity"))
         }
-        if let f = value("FilterDustLevel")?.intValue ?? value("TimeBasedFilterHealth")?.intValue {
-            out.append(Item(id: "filter", text: "Filter \(f)", symbol: "line.3.horizontal.decrease"))
-        }
-        if let pm = value("PM25Sensor")?.doubleValue {
+        if let pm = declared("PM25Sensor")?.doubleValue {
             out.append(Item(id: "pm", text: String(format: "PM2.5 %.0f", pm), symbol: "aqi.low"))
         }
-        if let w = value("CurrentPowerConsumption")?.doubleValue {
+        if let w = declared("CurrentPowerConsumption")?.doubleValue {
             out.append(Item(id: "power", text: String(format: "%.0f W", w), symbol: "bolt"))
         }
-        // Official app reads faults from "errors" (comma-separated); also honour the model's ACFaults key.
-        let faultText = (value("ACFaults") ?? raw["errors"])?.stringValue?.trimmingCharacters(in: .whitespaces) ?? ""
-        if !faultText.isEmpty, faultText != "0" {
-            out.append(Item(id: "fault", text: "Fault \(faultText)", symbol: "exclamationmark.triangle.fill", isFault: true))
+        let cleanFilter: Bool = {
+            switch raw["filterCleaningRequired"] {
+            case .bool(let b): return b
+            case .string(let s): return s.lowercased() == "true"
+            default: return false
+            }
+        }()
+        if cleanFilter {
+            let cause = text("filterCleaningCause")
+            out.append(Item(id: "filter", text: "Clean filter", symbol: "line.3.horizontal.decrease", style: .warning,
+                            help: cause.isEmpty ? nil : cause))
+        }
+        if let dust = raw["filterDustLevel"]?.intValue, dust > 0 {
+            out.append(Item(id: "dust", text: "Filter dust \(dust)", symbol: "line.3.horizontal.decrease"))
+        }
+        let warnings = text("warnings")
+        if !warnings.isEmpty {
+            out.append(Item(id: "warn", text: "Warning \(warnings)", symbol: "exclamationmark.circle.fill", style: .warning))
+        }
+        let errors = text("errors")
+        if !errors.isEmpty, errors != "0" {
+            out.append(Item(id: "error", text: "Error \(errors)", symbol: "exclamationmark.triangle.fill", style: .fault))
         }
         return out
     }
@@ -83,20 +111,159 @@ struct ACInfoRow: View {
         if !items.isEmpty {
             FlowLayout(spacing: 6) {
                 ForEach(items) { item in
-                    if item.isFault {
-                        StatusPill(text: item.text, color: .red, symbol: item.symbol)
-                    } else {
-                        Label(item.text, systemImage: item.symbol)
+                    Group {
+                        switch item.style {
+                        case .fault: StatusPill(text: item.text, color: .red, symbol: item.symbol)
+                        case .warning: StatusPill(text: item.text, color: .orange, symbol: item.symbol)
+                        case .plain:
+                            Label {
+                                Text(item.text)
+                            } icon: {
+                                if let signal = item.signal {
+                                    Image(systemName: item.symbol, variableValue: signal)
+                                } else {
+                                    Image(systemName: item.symbol)
+                                }
+                            }
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .monospacedDigit()
                             .padding(.horizontal, 8)
                             .padding(.vertical, 3)
                             .background(Capsule().fill(Color.primary.opacity(0.06)))
+                        }
                     }
+                    .help(item.help ?? item.text)
                 }
             }
         }
+    }
+}
+
+// MARK: Timer
+
+/// "Turn off in…" (AC on) / "Turn on in…" (AC off) with presets, a custom stepper and active-timer pills.
+struct ACTimerRow: View {
+    @EnvironmentObject private var ac: ACStore
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    let device: ACDevice
+
+    @ViewState private var customOpen = false
+    @ViewState private var customMinutes = 90
+
+    private var slot: ACStore.TimerSlot { device.state.power ? .off : .on }
+    private var range: ACRange { device.timerRange ?? ACRange(min: 10, max: 1440, step: 10) }
+    private var presets: [Int] { [30, 60, 120, 240, 480].filter { Double($0) >= range.min && Double($0) <= range.max } }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Image(systemName: "timer").font(.caption).foregroundStyle(.secondary).frame(width: 16)
+                    .accessibilityHidden(true)
+                Text(slot == .off ? "Turn off in" : "Turn on in").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Menu {
+                    ForEach(presets, id: \.self) { m in
+                        Button(Self.duration(m)) { ac.setTimer(device, slot, seconds: m * 60) }
+                    }
+                    Divider()
+                    Button("Custom…") {
+                        customMinutes = Int(min(range.max, max(range.min, 90)))
+                        customOpen = true
+                    }
+                } label: {
+                    Text("Set timer").font(.caption.weight(.medium))
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .accessibilityLabel(slot == .off ? "Set turn-off timer" : "Set turn-on timer")
+            }
+
+            if customOpen {
+                HStack(spacing: 8) {
+                    Stepper(value: $customMinutes, in: Int(range.min)...Int(range.max), step: Int(range.step)) {
+                        Text(Self.duration(customMinutes)).font(.caption).monospacedDigit()
+                    }
+                    Spacer()
+                    Button("Cancel") { customOpen = false }.buttonStyle(.borderless).font(.caption)
+                    Button("Set") {
+                        ac.setTimer(device, slot, seconds: customMinutes * 60)
+                        customOpen = false
+                    }
+                    .font(.caption.weight(.semibold))
+                }
+                .padding(.leading, 24)
+                .transition(.reveal(reduceMotion: reduceMotion))
+            }
+
+            let active: [(ACStore.TimerSlot, Date)] = [ACStore.TimerSlot.off, .on].compactMap { s in
+                ac.timerDate(device, s).map { (s, $0) }
+            }
+            if !active.isEmpty {
+                FlowLayout(spacing: 6) {
+                    ForEach(active, id: \.0.rawValue) { s, date in
+                        HStack(spacing: 4) {
+                            StatusPill(text: "\(s == .off ? "Off" : "On") at \(date.formatted(date: .omitted, time: .shortened))",
+                                       color: s == .off ? .orange : .green, symbol: "timer")
+                            Button { ac.setTimer(device, s, seconds: nil) } label: {
+                                Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.pressable)
+                            .help("Cancel timer")
+                            .accessibilityLabel("Cancel \(s == .off ? "turn-off" : "turn-on") timer")
+                        }
+                    }
+                }
+                .padding(.leading, 24)
+            }
+        }
+    }
+
+    static func duration(_ minutes: Int) -> String {
+        let h = minutes / 60, m = minutes % 60
+        switch (h, m) {
+        case (0, _): return "\(m) min"
+        case (_, 0): return "\(h) h"
+        default: return "\(h) h \(m) min"
+        }
+    }
+}
+
+// MARK: Profiles
+
+/// Saved local profiles as chips: click to apply, right-click to delete.
+struct ACProfilesRow: View {
+    @EnvironmentObject private var ac: ACStore
+    let device: ACDevice
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "square.stack").font(.caption).foregroundStyle(.secondary).frame(width: 16)
+                .accessibilityHidden(true)
+            FlowLayout(spacing: 6) {
+                ForEach(ac.profiles[device.id] ?? []) { p in
+                    Button { Task { await ac.applyProfile(device, p) } } label: {
+                        Text(p.name)
+                            .font(.caption.weight(.medium))
+                            .padding(.horizontal, 10)
+                            .frame(height: 24)
+                            .background(Capsule().fill(Color.primary.opacity(0.08)))
+                    }
+                    .buttonStyle(.pressable)
+                    .help(Self.summary(p) + " — right-click to delete")
+                    .contextMenu {
+                        Button("Delete “\(p.name)”", role: .destructive) { ac.deleteProfile(device, p) }
+                    }
+                    .accessibilityLabel("Apply profile \(p.name)")
+                }
+            }
+        }
+    }
+
+    static func summary(_ p: ACProfile) -> String {
+        guard p.power else { return "Turns the AC off" }
+        let t = p.temp == p.temp.rounded() ? String(format: "%.0f°", p.temp) : String(format: "%.1f°", p.temp)
+        return "\(p.mode.capitalized), \(t), fan \(p.fan)"
     }
 }
 
@@ -118,6 +285,9 @@ struct ACMoreControls: View {
         let intCaps = ["VerticalSwing", "HorizontalSwing", "Convertible", "ACGenMode"].compactMap { n in
             caps.first { $0.name == n }
         }
+
+        let cleanKey = device.capability("EvaporatorClean")?.key
+        let cleaning = cleanKey.map { device.state.raw[$0]?.stringValue?.lowercased() == "on" } ?? false
 
         VStack(alignment: .leading, spacing: 10) {
             if caps.isEmpty {
@@ -154,6 +324,8 @@ struct ACMoreControls: View {
 
             ForEach(intCaps) { cap in
                 if case .intChoice(let options) = cap.kind, !options.isEmpty {
+                    let isSwing = cap.name.hasSuffix("Swing")
+                    let lastSwing = intCaps.last(where: { $0.name.hasSuffix("Swing") })?.name == cap.name
                     LabeledChips(title: cap.label) {
                         ForEach(options, id: \.self) { opt in
                             OptionTile(title: opt.label, symbol: "", selected: device.state.raw[cap.key]?.intValue == opt.value,
@@ -162,9 +334,53 @@ struct ACMoreControls: View {
                             }
                         }
                     }
+                    .disabled(isSwing && cleaning)
+                    .opacity(isSwing && cleaning ? 0.5 : 1)
+                    if lastSwing && cleaning {
+                        Label("Swing is locked while Clean runs", systemImage: "lock.fill")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
+
+            SaveProfileRow(device: device)
         }
+    }
+}
+
+/// "Save current settings as profile…" with an inline name field.
+private struct SaveProfileRow: View {
+    @EnvironmentObject private var ac: ACStore
+    let device: ACDevice
+    @ViewState private var editing = false
+    @ViewState private var name = ""
+
+    var body: some View {
+        if editing {
+            HStack(spacing: 6) {
+                TextField("Profile name (e.g. Night)", text: $name)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit(save)
+                    .onExitCommand { editing = false }
+                Button("Cancel") { editing = false }.buttonStyle(.borderless).font(.caption)
+                Button("Save", action: save).font(.caption.weight(.semibold)).disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        } else {
+            Button {
+                name = ""
+                editing = true
+            } label: {
+                Label("Save current settings as profile…", systemImage: "square.and.arrow.down")
+                    .font(.caption.weight(.medium))
+            }
+            .buttonStyle(.borderless)
+        }
+    }
+
+    private func save() {
+        ac.saveProfile(device, name: name)
+        editing = false
     }
 }
 

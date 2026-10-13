@@ -54,8 +54,8 @@ struct ACDevice: Identifiable, Codable {
 
 @MainActor
 final class ACStore: ObservableObject {
-    static let modes = ["auto", "cool", "dry", "fan", "heat"]
-    static let fanSpeeds = ["auto", "quiet", "low", "medium", "high"]
+    nonisolated static let modes = ["auto", "cool", "dry", "fan", "heat"]
+    nonisolated static let fanSpeeds = ["auto", "quiet", "low", "medium", "high"]
 
     @Published private(set) var loggedIn = false
     @Published private(set) var devices: [ACDevice] = []
@@ -70,6 +70,18 @@ final class ACStore: ObservableObject {
         }
     }
 
+    /// Experimental: fetch LAN keys and try discovery even when the model lacks `udpControl`.
+    @Published var tryLocal: Bool {
+        didSet {
+            UserDefaults.standard.set(tryLocal, forKey: "acTryLocal")
+            Task { await refresh() }
+        }
+    }
+    /// Per AC: "answered", "timeout", "no key" or "not attempted" (for diagnostics).
+    @Published private(set) var lastLocalDiscovery: [String: String] = [:]
+    /// Saved local profiles per AC id.
+    @Published private(set) var profiles: [String: [ACProfile]] = [:]
+
     private let api = MirAIeAPI()
     private let local = LocalACTransport()
     private var clients: [String: MQTTClient] = [:]
@@ -80,13 +92,20 @@ final class ACStore: ObservableObject {
 
     init() {
         localOnly = UserDefaults.standard.bool(forKey: "acLocalOnly")
+        tryLocal = UserDefaults.standard.bool(forKey: "acTryLocal")
         local.onStatus = { [weak self] deviceId, json in
             MainActor.assumeIsolated { self?.applyStatus(json, deviceId: deviceId, fromLocal: true) }
         }
         if let data = UserDefaults.standard.data(forKey: "acDevices"),
            let cached = try? JSONDecoder().decode([ACDevice].self, from: data) {
             devices = cached
+            for d in cached { profiles[d.id] = Self.loadProfiles(d.id) }
         }
+        #if DEBUG
+        // Snapshot/self-check runs use sample data only: never touch the real session, cloud or LAN.
+        let env = ProcessInfo.processInfo.environment
+        if env["HOMEBAR_SNAPSHOT"] != nil || env["HOMEBAR_KEYTEST"] != nil { return }
+        #endif
         rediscoverTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             Task { @MainActor in await self?.connectTransports() }
         }
@@ -152,7 +171,8 @@ final class ACStore: ObservableObject {
                         list[i].udpCapable = nil
                     }
                 }
-                if localInfo(list[i].id) == nil, list[i].udpCapable != false {
+                profiles[list[i].id] = Self.loadProfiles(list[i].id)
+                if localInfo(list[i].id) == nil, list[i].udpCapable != false || tryLocal {
                     await fetchLocalInfo(deviceId: list[i].id)
                 }
                 if !localOnly,
@@ -249,6 +269,9 @@ final class ACStore: ObservableObject {
                 "transport": .string(d.transport.rawValue),
                 "model": d.model ?? .null,
                 "lastStatus": .object(d.state.raw),
+                "firmware": d.state.raw["V"] ?? .null,
+                "lanKeyAvailable": .bool(localInfo(d.id) != nil),
+                "lastLocalDiscovery": .string(lastLocalDiscovery[d.id] ?? "not attempted"),
                 "parsedCapabilities": .array(d.capabilities.map { c in
                     .object(["name": .string(c.name), "key": .string(c.key), "ki": .number(Double(c.ki)),
                              "kind": .string(c.kindName), "values": .string(c.valuesSummary)])
@@ -263,6 +286,7 @@ final class ACStore: ObservableObject {
         return JSONValue.object([
             "app": .string("HomeBar \(version) (macOS)"),
             "localOnly": .bool(localOnly),
+            "tryLocalExperimental": .bool(tryLocal),
             "cloudConnected": .bool(mqttConnected),
             "acs": .array(acs),
         ]).prettyText()
@@ -337,13 +361,22 @@ final class ACStore: ObservableObject {
 
     /// Tries LAN discovery for each device (~3 s); devices that don't answer fall back to MQTT unless local-only.
     func connectTransports() async {
+        var results: [String: String] = [:]
         await withTaskGroup(of: (String, String?).self) { group in
-            for d in devices where d.udpCapable != false {
-                guard let info = localInfo(d.id) else { continue }
+            for d in devices {
+                guard d.udpCapable != false || tryLocal else {
+                    results[d.id] = "not attempted"
+                    continue
+                }
+                guard let info = localInfo(d.id) else {
+                    results[d.id] = "no key"
+                    continue
+                }
                 local.register(deviceId: d.id, info: info)
                 group.addTask { [local] in (d.id, await local.discover(deviceId: d.id)) }
             }
             for await (id, ip) in group {
+                results[id] = ip == nil ? "timeout" : "answered"
                 guard let i = devices.firstIndex(where: { $0.id == id }) else { continue }
                 if let ip {
                     devices[i].transport = .local
@@ -357,6 +390,7 @@ final class ACStore: ObservableObject {
                 }
             }
         }
+        lastLocalDiscovery = results
         for i in devices.indices where devices[i].transport != .local {
             devices[i].transport = localOnly ? .unavailable : .cloud
         }
@@ -475,9 +509,11 @@ final class ACStore: ObservableObject {
     }
 
     func setTemp(_ d: ACDevice, _ t: Double) {
-        let clamped = min(30, max(16, (t * 2).rounded() / 2))
+        let r = d.tempRange
+        let stepped = (t / r.step).rounded() * r.step
+        let clamped = min(r.max, max(r.min, stepped))
         update(d) { $0.setTemp = clamped }
-        let text = clamped == clamped.rounded() ? String(Int(clamped)) : String(format: "%.1f", clamped)
+        let text = String(format: "%.1f", clamped) // official app uses DecimalFormat("#.0") → "26.0"
         send(d, key: d.keys.temp, value: text, ki: ACKeyIndex.temp)
     }
 
@@ -497,52 +533,178 @@ final class ACStore: ObservableObject {
         update(d) { $0.fan = fan }
         send(d, key: d.keys.fan, value: fan, ki: ACKeyIndex.fan)
     }
+
+    // MARK: Timer (ACTimer, PROTOCOL.md §1.8)
+
+    enum TimerSlot: Int { case off = 0, on = 1 }
+
+    /// Active timer fire times from status `actm` (UTC epoch seconds, -1 = unset); nil when unset or past.
+    func timerDate(_ d: ACDevice, _ slot: TimerSlot) -> Date? {
+        guard let cap = d.capability("ACTimer"),
+              let arr = d.state.raw[cap.key]?.arrayValue, arr.count == 2,
+              let epoch = arr[slot.rawValue].doubleValue, epoch > 0 else { return nil }
+        let date = Date(timeIntervalSince1970: epoch)
+        return date > Date() ? date : nil
+    }
+
+    /// Sets (seconds from now) or cancels (nil) one timer slot. Sends `[offSeconds, onSeconds]`
+    /// as relative seconds, keeping the other slot as its remaining time (-1 when unset).
+    func setTimer(_ d: ACDevice, _ slot: TimerSlot, seconds: Int?) {
+        guard let cap = d.capability("ACTimer"), let i = devices.firstIndex(where: { $0.id == d.id }) else { return }
+        let now = Date()
+        func remaining(_ s: TimerSlot) -> Int {
+            guard let date = timerDate(devices[i], s) else { return -1 }
+            return max(1, Int(date.timeIntervalSince(now)))
+        }
+        var relative = [remaining(.off), remaining(.on)]
+        relative[slot.rawValue] = seconds.map { max(1, $0) } ?? -1
+        // Optimistic status in the AC's own format (UTC epoch seconds).
+        let utc = relative.map { $0 < 0 ? -1.0 : (now.timeIntervalSince1970 + Double($0)).rounded() }
+        devices[i].state.raw[cap.key] = .array(utc.map(JSONValue.number))
+        send(devices[i], key: cap.key, value: relative, ki: cap.ki)
+    }
+
+    // MARK: Local profiles
+
+    private static func profilesKey(_ id: String) -> String { "acProfiles-\(id)" }
+
+    private static func loadProfiles(_ id: String) -> [ACProfile] {
+        guard let data = UserDefaults.standard.data(forKey: profilesKey(id)) else { return [] }
+        return (try? JSONDecoder().decode([ACProfile].self, from: data)) ?? []
+    }
+
+    private func storeProfiles(_ id: String) {
+        if let data = try? JSONEncoder().encode(profiles[id] ?? []) {
+            UserDefaults.standard.set(data, forKey: Self.profilesKey(id))
+        }
+    }
+
+    /// Saves the AC's current settings under `name` (replacing a profile with the same name).
+    func saveProfile(_ d: ACDevice, name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return }
+        let raw = d.state.raw
+        let p = ACProfile(
+            name: trimmed, power: d.state.power, mode: d.state.mode, temp: d.state.setTemp, fan: d.state.fan,
+            verticalSwing: d.capability("VerticalSwing").flatMap { raw[$0.key]?.intValue },
+            horizontalSwing: d.capability("HorizontalSwing").flatMap { raw[$0.key]?.intValue },
+            display: d.capability("DisplayControl").flatMap { raw[$0.key]?.stringValue }
+        )
+        var list = profiles[d.id] ?? []
+        list.removeAll { $0.name.caseInsensitiveCompare(trimmed) == .orderedSame }
+        list.append(p)
+        profiles[d.id] = list
+        storeProfiles(d.id)
+    }
+
+    func deleteProfile(_ d: ACDevice, _ p: ACProfile) {
+        profiles[d.id]?.removeAll { $0.id == p.id }
+        storeProfiles(d.id)
+    }
+
+    /// Applies a profile as separate commands ~300 ms apart: power first when turning on,
+    /// only settings that differ, and power last when the profile turns the AC off.
+    func applyProfile(_ d: ACDevice, _ p: ACProfile) async {
+        var steps: [() -> Void] = []
+        func current() -> ACDevice? { devices.first { $0.id == d.id } }
+        guard let start = current() else { return }
+        if !p.power {
+            if start.state.power { steps.append { [weak self] in if let c = current() { self?.setPower(c, false) } } }
+        } else {
+            if !start.state.power { steps.append { [weak self] in if let c = current() { self?.setPower(c, true) } } }
+            if start.state.mode != p.mode { steps.append { [weak self] in if let c = current() { self?.setMode(c, p.mode) } } }
+            if start.state.setTemp != p.temp { steps.append { [weak self] in if let c = current() { self?.setTemp(c, p.temp) } } }
+            if start.state.fan != p.fan { steps.append { [weak self] in if let c = current() { self?.setFan(c, p.fan) } } }
+            for (name, value) in [("VerticalSwing", p.verticalSwing), ("HorizontalSwing", p.horizontalSwing)] {
+                if let value, let cap = start.capability(name), start.state.raw[cap.key]?.intValue != value {
+                    steps.append { [weak self] in if let c = current() { self?.send(c, capability: cap, value: value) } }
+                }
+            }
+            if let display = p.display, let cap = start.capability("DisplayControl"),
+               start.state.raw[cap.key]?.stringValue != display {
+                steps.append { [weak self] in if let c = current() { self?.send(c, capability: cap, value: display) } }
+            }
+        }
+        for (n, step) in steps.enumerated() {
+            if n > 0 { try? await Task.sleep(for: .milliseconds(300)) }
+            step()
+        }
+    }
+}
+
+/// A saved set of AC settings, applied locally as individual commands.
+struct ACProfile: Codable, Identifiable, Equatable {
+    var id = UUID()
+    var name: String
+    var power: Bool
+    var mode: String
+    var temp: Double
+    var fan: String
+    var verticalSwing: Int?
+    var horizontalSwing: Int?
+    var display: String?
 }
 
 #if DEBUG
 extension ACStore {
-    /// Sample data for UI snapshots (`HOMEBAR_SNAPSHOT`).
+    /// Sample data for UI snapshots (`HOMEBAR_SNAPSHOT`). The first AC mirrors the real model 130185
+    /// and status from the user's diagnostics (PROTOCOL.md §1.8), with an active off timer.
     func seedDemo() {
         loggedIn = true
-        var bedroom = ACDevice(id: "d1", name: "Bedroom AC", space: "Bedroom", homeId: "h", topic: "h/d1", modelId: nil)
-        bedroom.state = ACState(power: true, mode: "cool", setTemp: 24, roomTemp: 28, fan: "auto", online: true)
-        bedroom.transport = .local
-        bedroom.modelId = "demo-model"
+        var bedroom = ACDevice(id: "d1", name: "Bedroom AC", space: "Bedroom", homeId: "h", topic: "h/d1", modelId: "130185")
+        bedroom.state = ACState(power: true, mode: "cool", setTemp: 26, roomTemp: 32, fan: "auto", online: true)
+        bedroom.transport = .cloud
+        bedroom.udpCapable = false
         bedroom.model = try? JSONDecoder().decode(JSONValue.self, from: Data(Self.demoModel.utf8))
-        bedroom.state.raw = ["ps": .string("on"), "acmd": .string("cool"), "actmp": .number(24), "rmtmp": .number(28),
-                             "acfs": .string("auto"), "acvs": .number(0), "achs": .number(3), "acdc": .string("on"),
-                             "acec": .string("off"), "acpm": .string("on"), "acng": .string("on"), "accnv": .number(80),
-                             "rmhmd": .number(62), "acfdl": .number(2), "accpc": .number(840), "errors": .string("H11")]
+        let offAt = (Date().timeIntervalSince1970 + 2 * 3600).rounded()
+        bedroom.state.raw = [
+            "V": .string("3.02"), "ps": .string("on"), "acmd": .string("cool"), "actmp": .string("26.0"),
+            "rmtmp": .string("32.0"), "acfs": .string("auto"), "acvs": .number(0), "achs": .number(0),
+            "acdc": .string("on"), "acem": .string("off"), "acec": .string("off"), "acpm": .string("off"),
+            "bzr": .string("on"), "cnv": .number(0), "acsp": .string("none"),
+            "actm": .array([.number(offAt), .number(-1)]),
+            "errors": .string(""), "warnings": .string(""), "filterDustLevel": .number(0),
+            "filterCleaningRequired": .bool(true), "filterCleaningCause": .string("Operating hours"),
+            "rssi": .number(-56), "onlineStatus": .string("true"),
+        ]
         var living = ACDevice(id: "d2", name: "Living Room AC", space: "Living Room", homeId: "h", topic: "h/d2", modelId: nil)
         living.state = ACState(power: false, mode: "dry", setTemp: 25.5, roomTemp: 30, fan: "low", online: true)
         living.transport = .cloud
         devices = [bedroom, living]
+        profiles["d1"] = [
+            ACProfile(name: "Night", power: true, mode: "cool", temp: 27, fan: "quiet", verticalSwing: 0, horizontalSwing: 0, display: "off"),
+            ACProfile(name: "Quick cool", power: true, mode: "cool", temp: 22, fan: "high", verticalSwing: 0, horizontalSwing: 0, display: "on"),
+        ]
     }
 
+    /// Model 130185 exactly as returned by `deviceManagement/deviceModels/modelId/130185`.
     static let demoModel = """
-    {"controlCapabilities":[
-      {"capability":"PowerStatus","attributes":[{"key":"ps","values":["on","off"]}]},
-      {"capability":"ACMode","attributes":[{"key":"acmd","values":["auto","cool","dry","fan","heat"]}]},
-      {"capability":"ACTemperature","attributes":[{"key":"actmp"}]},
-      {"capability":"ACFanSpeed","attributes":[{"key":"acfs"}]},
-      {"capability":"VerticalSwing","attributes":[{"key":"acvs","range":{"min":[{"value":0}],"max":[{"value":5}],"increment":[{"value":1}]}}]},
-      {"capability":"HorizontalSwing","attributes":[{"key":"achs","range":{"min":[{"value":0}],"max":[{"value":5}],"increment":[{"value":1}]}}]},
-      {"capability":"DisplayControl","attributes":[{"key":"acdc","values":["on","night","off"]}]},
-      {"capability":"ECOMode","attributes":[{"key":"acec","values":["on","off"]}]},
-      {"capability":"PowerfulMode","attributes":[{"key":"acpm","values":["on","off"]}]},
-      {"capability":"EvaporatorClean","attributes":[{"key":"acecl","values":["on","off"]}]},
-      {"capability":"NanoeG","attributes":[{"key":"acng","values":["on","off"]}]},
-      {"capability":"BuzzerControl","attributes":[{"key":"acbz","values":["on","off"]}]},
-      {"capability":"Convertible","attributes":[{"key":"accnv","values":["40","55","70","80","90","100","110","OFF"]}]}
-    ],
-    "configCapabilities":[{"capability":"udpControl","attributes":[{"key":"udp"}]}],
-    "statusCapabilitiesV2":[
-      {"capability":"RoomTemperature","attributes":[{"key":"rmtmp"}]},
-      {"capability":"RoomHumidity","attributes":[{"key":"rmhmd"}]},
-      {"capability":"FilterDustLevel","attributes":[{"key":"acfdl","range":{"min":[{"value":0}],"max":[{"value":5}]}}]},
-      {"capability":"CurrentPowerConsumption","attributes":[{"key":"accpc"}]},
-      {"capability":"ACFaults","attributes":[{"key":"errors"}]}
-    ]}
+    {"configCapabilities":[{"capability":"ProximityNotification"}],
+     "controlCapabilities":[
+      {"capability":"ACFanSpeed","attributes":[{"key":"acfs","values":["auto","quiet","low","medium","high"]}]},
+      {"capability":"ACMode","attributes":[{"key":"acmd","values":["auto","cool","dry","fan"]}]},
+      {"capability":"ACTemperature","attributes":[{"key":"actmp","range":{
+        "increment":[{"unit":"celcius","value":1},{"unit":"fahrenheit","value":1}],
+        "max":[{"unit":"celcius","value":30},{"unit":"fahrenheit","value":86}],
+        "min":[{"unit":"celcius","value":16},{"unit":"fahrenheit","value":61}]}}]},
+      {"capability":"ACTimer","attributes":[{"key":"actm","range":{"increment":[{"value":10}],"max":[{"value":1440}],"min":[{"value":10}]}}]},
+      {"capability":"Convertible","attributes":[{"key":"cnv","intValues":[110,100,90,80,70,55,40,0]}]},
+      {"capability":"DisplayControl","attributes":[{"key":"acdc","values":["on","off"]}]},
+      {"capability":"ECOMode","attributes":[{"key":"acem","values":["on","off"]}]},
+      {"capability":"EvaporatorClean","attributes":[{"key":"acec"}]},
+      {"capability":"HorizontalSwing","attributes":[{"key":"achs","range":{"increment":[{"value":1}],"max":[{"value":5}],"min":[{"value":0}]}}]},
+      {"capability":"PowerStatus","attributes":[{"key":"ps"}]},
+      {"capability":"PowerfulMode","attributes":[{"key":"acpm"}]},
+      {"capability":"SleepProfile","attributes":[{"key":"acsp"},
+        {"key":"duration","range":{"increment":[{"unit":"hours","value":1}],"max":[{"unit":"hours","value":8}],"min":[{"unit":"hours","value":2}]}},
+        {"key":"temps","range":{"increment":[{"unit":"celcius","value":1},{"unit":"fahrenheit","value":1}],
+          "max":[{"unit":"celcius","value":30},{"unit":"fahrenheit","value":86}],"min":[{"unit":"celcius","value":16},{"unit":"fahrenheit","value":61}]}}]},
+      {"capability":"TimeBasedFilterHealth","attributes":[{"key":"acfh","range":{"alert":[{"unit":"hours","value":500}],
+        "reminder":[{"unit":"hours","value":100}],"warning":[{"unit":"hours","value":200}]}}]},
+      {"capability":"VerticalSwing","attributes":[{"key":"acvs","range":{"increment":[{"value":1}],"max":[{"value":5}],"min":[{"value":0}]}}]},
+      {"capability":"BuzzerControl","attributes":[{"key":"bzr","minFwVersion":3.02,"values":["on","off"]}]}
+     ],
+     "statusCapabilitiesV2":[{"capability":"ACFaults"},{"capability":"PowerConsumption"}]}
     """
 }
 #endif

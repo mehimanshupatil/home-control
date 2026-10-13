@@ -16,6 +16,7 @@ Guide for coding agents (and humans) working in this repo. Read [README.md](READ
 | Mac debug build | `cd mac && swift build` |
 | Mac UI snapshots (sample data) | `cd mac && HOMEBAR_SNAPSHOT=/some/dir .build/debug/HomeBar` |
 | Mac self-checks (key code round trip) | `cd mac && HOMEBAR_KEYTEST=1 .build/debug/HomeBar` |
+| Mac self-checks (redaction, model parsing, timer payload) | run with `HOMEBAR_SNAPSHOT` (above) and check that every line prints `PASS` |
 | Android debug APK | `cd android && JAVA_HOME=$(/usr/libexec/java_home -v 17) ./gradlew assembleDebug` |
 | Android unit tests | `cd android && JAVA_HOME=$(/usr/libexec/java_home -v 17) ./gradlew testDebugUnitTest` |
 | Android demo UI | install the debug APK on an **emulator**, then `adb shell am start -n in.canvs.homecontrol/.MainActivity --ez demo true` |
@@ -33,8 +34,10 @@ Every change must build. UI changes should be checked visually (snapshots or emu
 ## Gotchas
 - **No Xcode on the dev machine:** with Command Line Tools only, SwiftUI's `@State` macro plugin is missing. Use `@ViewState` (a typealias in `StateCompat.swift`) instead of `@State`. `@Environment`, `@AppStorage`, `@StateObject` and `@EnvironmentObject` work normally.
 - The Mac app's release build excludes everything under `#if DEBUG` (snapshot harness, demo seeding).
+- The debug binary shares the Keychain service `in.canvs.homebar` with the installed app. `ACStore` therefore skips its startup (session, cloud, LAN) when `HOMEBAR_SNAPSHOT` or `HOMEBAR_KEYTEST` is set; keep that guard.
+- The Mac demo AC mirrors the real model 130185 (PROTOCOL.md §1.8). Keep it in sync if the real model changes.
 - Android needs **JDK 17**; newer JDKs break the AGP version in use.
 - Material 3 `Slider(track = …)` is experimental; opt in with `@OptIn(ExperimentalMaterial3Api::class)`.
 - MirAIe UDP: discovery request is plaintext; everything else is AES-CBC with zero padding (not PKCS#7). Trailing `0x00` must be stripped after decrypt.
-- MirAIe command values are strings for temperature (`"24"`, `"24.5"`), matching the official app.
+- MirAIe temperature is sent as a string with one decimal (`"26.0"`, `"24.5"`), matching the official app's `DecimalFormat("#.0")`.
 - WiZ replies come from the bulb's IP; discovery must collect for the full timeout because bulbs answer at different times.

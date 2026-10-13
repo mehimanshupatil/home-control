@@ -99,7 +99,7 @@ object CapabilityCatalog {
                     "ACGenMode" -> (strings.mapNotNull { it.toIntOrNull() } + ints).distinct().filter { it in GEN_MODE_PAYLOAD }
                         .ifEmpty { GEN_MODE_PAYLOAD.keys.toList() }
                     else -> ints.ifEmpty { (0..5).toList() }
-                }.let { if (name == "Convertible" || name == "ACGenMode") (it - 0) + 0 else it }
+                }.let { if (name == "Convertible" || name == "ACGenMode") it.filter { v -> v != 0 }.sorted() + 0 else it }
                 CapabilitySpec(name, key, info.ki, info.kind, info.label, intValues = values)
             }
             else -> CapabilitySpec(name, key, info.ki, info.kind, info.label)
@@ -141,9 +141,100 @@ object CapabilityCatalog {
 
     fun choiceLabel(value: String) = value.replaceFirstChar { it.uppercase() }
 
+    /** Core controls (mode, fan, temperature, timer) from the model; app defaults when absent. */
+    fun core(modelJson: String?): CoreSpec {
+        val model = modelJson?.let { runCatching { JSONObject(it) }.getOrNull() } ?: return CoreSpec()
+        val caps = model.optJSONArray("controlCapabilities") ?: return CoreSpec()
+        fun attr(name: String): JSONObject? = (0 until caps.length()).asSequence()
+            .mapNotNull { caps.optJSONObject(it) }
+            .firstOrNull { it.optString("capability") == name }
+            ?.optJSONArray("attributes")?.optJSONObject(0)
+
+        val modes = attr("ACMode")?.optJSONArray("values").strings()
+        val fans = attr("ACFanSpeed")?.optJSONArray("values").strings()
+        val tempRange = attr("ACTemperature")?.optJSONObject("range")
+        val timer = attr("ACTimer")
+        val defaults = CoreSpec()
+        return CoreSpec(
+            modes = modes.ifEmpty { defaults.modes },
+            fanSpeeds = fans.ifEmpty { defaults.fanSpeeds },
+            tempMin = tempRange?.let { celsius(it, "min") } ?: defaults.tempMin,
+            tempMax = tempRange?.let { celsius(it, "max") } ?: defaults.tempMax,
+            tempStep = tempRange?.let { celsius(it, "increment") }?.takeIf { it > 0 } ?: defaults.tempStep,
+            timer = timer?.let {
+                val r = it.optJSONObject("range")
+                fun v(f: String) = r?.optJSONArray(f)?.optJSONObject(0)?.optInt("value", -1)?.takeIf { x -> x > 0 }
+                TimerSpec(
+                    key = it.optString("key").ifEmpty { "actm" },
+                    minMinutes = v("min") ?: 10,
+                    maxMinutes = v("max") ?: 1440,
+                    stepMinutes = v("increment") ?: 10,
+                )
+            },
+        )
+    }
+
+    /** Value of the `celcius` (sic, as sent by MirAIe) entry of a range field, else the first entry. */
+    private fun celsius(range: JSONObject, field: String): Double? {
+        val arr = range.optJSONArray(field) ?: return null
+        val entries = (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }
+        val e = entries.firstOrNull { it.optString("unit").lowercase().startsWith("cel") } ?: entries.firstOrNull()
+        return e?.optDouble("value")?.takeIf { !it.isNaN() }
+    }
+
     private fun JSONArray?.strings(): List<String> =
         if (this == null) emptyList() else (0 until length()).mapNotNull { optString(it).takeIf { s -> s.isNotEmpty() } }
 
     private fun JSONArray?.ints(): List<Int> =
         if (this == null) emptyList() else (0 until length()).mapNotNull { opt(it)?.toString()?.toDoubleOrNull()?.toInt() }
+}
+
+/** Core control options for one AC model. Defaults match the app's original fixed controls. */
+data class CoreSpec(
+    val modes: List<String> = listOf("auto", "cool", "heat", "dry", "fan"),
+    val fanSpeeds: List<String> = listOf("auto", "quiet", "low", "medium", "high"),
+    val tempMin: Double = 16.0,
+    val tempMax: Double = 30.0,
+    val tempStep: Double = 0.5,
+    /** null when the model doesn't list ACTimer. */
+    val timer: TimerSpec? = null,
+)
+
+/** `ACTimer` (ki 14). Range is in minutes. */
+data class TimerSpec(val key: String, val minMinutes: Int, val maxMinutes: Int, val stepMinutes: Int) {
+    companion object { const val KI = 14 }
+}
+
+/**
+ * Timer payload maths (PROTOCOL.md §1.8). The AC takes relative seconds `[offSeconds, onSeconds]`
+ * (-1 = unset) and reports UTC epoch seconds `[offUTC, onUTC]` (-1 = unset).
+ */
+object TimerMath {
+
+    /** Reads `[offUTC, onUTC]` from a raw status value (org.json array, list or "[a,b]" text). */
+    fun parseStatus(value: Any?): Pair<Long, Long> {
+        val parts: List<Long> = when (value) {
+            is JSONArray -> (0 until value.length()).map { value.optLong(it, -1) }
+            is List<*> -> value.map { it?.toString()?.toDoubleOrNull()?.toLong() ?: -1L }
+            is String -> value.trim('[', ']', ' ').split(',').map { it.trim().toDoubleOrNull()?.toLong() ?: -1L }
+            else -> emptyList()
+        }
+        return (parts.getOrNull(0) ?: -1L) to (parts.getOrNull(1) ?: -1L)
+    }
+
+    /** Remaining seconds until [utc], or -1 when unset or already past. */
+    fun remaining(utc: Long, nowSec: Long): Long = if (utc > nowSec) utc - nowSec else -1L
+
+    /**
+     * Payload to set (or, with [seconds] = -1, cancel) one slot while keeping the other slot's remaining time.
+     * Returns `[offSeconds, onSeconds]`.
+     */
+    fun payload(offSlot: Boolean, seconds: Long, status: Any?, nowSec: Long): List<Long> {
+        val (offUtc, onUtc) = parseStatus(status)
+        val s = if (seconds > 0) seconds else -1L
+        return if (offSlot) listOf(s, remaining(onUtc, nowSec)) else listOf(remaining(offUtc, nowSec), s)
+    }
+
+    /** UTC equivalent of a relative payload, used for the optimistic status update. */
+    fun toUtc(payload: List<Long>, nowSec: Long): List<Long> = payload.map { if (it > 0) nowSec + it else -1L }
 }

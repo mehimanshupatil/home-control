@@ -124,6 +124,9 @@ private fun Header(
                     CheckItem("AC: Local network only", acState.localOnly) { ac.setLocalOnly(!acState.localOnly) }
                     CheckItem("Show AC keys", showKeys) { onToggleKeys(); menuOpen = false }
                     CheckItem("AC diagnostics", showDiagnostics) { onToggleDiagnostics(); menuOpen = false }
+                    CheckItem("Try local control (experimental)", acState.experimentalLocal) {
+                        ac.setExperimentalLocal(!acState.experimentalLocal)
+                    }
                     DropdownMenuItem(
                         text = { Text("Copy AC key code") },
                         enabled = ac.exportable.isNotEmpty(),

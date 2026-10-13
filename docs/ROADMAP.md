@@ -4,13 +4,20 @@
 - Mac menu bar app and Android app with matching UI.
 - MirAIe: cloud bootstrap, local UDP control with cloud fallback, Local network only mode, key-code backup and restore, model-driven More controls, info chips, redacted diagnostics.
 - WiZ: discovery, on/off, brightness, white temperature, colour, grouped scenes with speed, Identify, local rename.
+- Mac and Android, built against real model 130185 (PROTOCOL.md §1.8):
+  - Mode, fan, temperature range/step, Convertible and Display choices come from the model.
+  - Real status chips: Wi-Fi signal, Clean filter, filter dust, errors and warnings.
+  - Timers (relative seconds, status in UTC) with presets, custom duration and cancel.
+  - Swing is locked while Clean runs.
+  - Local profiles: save, apply and delete.
+  - Experimental "Try local control" for models without `udpControl`; diagnostics report `lanKeyAvailable` and `lastLocalDiscovery`.
 
-## Next (needs real-device diagnostics first)
-1. **Confirm against a real AC:** status key names (humidity, filter, power, faults), swing value meaning, and whether the AC pushes status over UDP without a prior command.
-2. **Timers:** `ACTimer` sends `[offTimer, onTimer]`. The official app has two builders (relative seconds and UTC epoch seconds), so which one the firmware expects must be tested. UI: "Turn off in…" and "Turn on at…".
-3. **Local profiles:** user-defined presets (for example *Night*: 26°, Quiet, display off, swing auto) stored in the app and applied as a sequence of local commands. This replaces the cloud-only MirAIe action groups.
-4. **Clean mode guard:** the official app disables swing while Clean runs; mirror that.
-5. **Intesis / Comfort Cloud bridged ACs:** these use the `/tcontrol` MQTT topic, which isn't handled yet.
+## Next
+1. **Test on the real AC:** that a timer set from the app appears in `actm` and fires, and that profiles apply cleanly over MQTT.
+2. **Try local control (experimental):** report whether the AC answers `DISC_REQ` even though model 130185 lacks `udpControl`.
+3. **Sleep profile (`acsp`):** status shows `"none"`; the payload needs a cloud profile id (`pid`), so it's not built.
+4. **Intesis / Comfort Cloud bridged ACs:** these use the `/tcontrol` MQTT topic, which isn't handled yet.
+5. **ECO sets 26°:** the official app sets 26° when ECO turns on; decide whether to mirror it.
 
 ## Later
 - WiZ fade-in/out and startup mode (needs `getUserConfig`/`setUserConfig` shapes confirmed on a bulb).

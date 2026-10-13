@@ -54,6 +54,16 @@ class SecureStore(context: Context) {
         get() = plain.getBoolean(KEY_LOCAL_ONLY, false)
         set(v) = plain.edit { putBoolean(KEY_LOCAL_ONLY, v) }
 
+    /** Experimental: try LAN control even when the AC model doesn't list `udpControl`. */
+    var experimentalLocal: Boolean
+        get() = plain.getBoolean(KEY_EXPERIMENTAL_LOCAL, false)
+        set(v) = plain.edit { putBoolean(KEY_EXPERIMENTAL_LOCAL, v) }
+
+    /** Local AC profiles for one device, as a JSON array string. */
+    fun acProfiles(deviceId: String): String? = plain.getString("ac_profiles_$deviceId", null)
+
+    fun setAcProfiles(deviceId: String, json: String) = plain.edit { putString("ac_profiles_$deviceId", json) }
+
     fun clearMiraie() = secure.edit { clear() }
 
     fun bulbName(mac: String): String? = plain.getString("bulb_name_$mac", null)
@@ -70,5 +80,6 @@ class SecureStore(context: Context) {
         const val KEY_EXPIRES = "expires_at"
         const val KEY_DEVICES = "devices_cache"
         const val KEY_LOCAL_ONLY = "local_only"
+        const val KEY_EXPERIMENTAL_LOCAL = "experimental_local"
     }
 }

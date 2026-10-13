@@ -131,6 +131,12 @@ struct ACCard: View {
             temperatureRow
             ACInfoRow(device: device)
             controls
+            if device.timerRange != nil {
+                ACTimerRow(device: device)
+            }
+            if !(ac.profiles[device.id] ?? []).isEmpty {
+                ACProfilesRow(device: device)
+            }
             moreToggle
             if showMore {
                 ACMoreControls(device: device, tint: tint)
@@ -167,7 +173,7 @@ struct ACCard: View {
                 Text(state.power ? "Set to" : "Off")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Text(Self.format(state.setTemp))
+                Text(Self.format(device.tempRange.step >= 1 ? state.setTemp.rounded() : state.setTemp))
                     .font(.system(size: 40, weight: .semibold, design: .rounded))
                     .monospacedDigit()
                     .foregroundStyle(state.power ? Color.primary : Color.secondary)
@@ -182,14 +188,15 @@ struct ACCard: View {
                         .monospacedDigit()
                 }
                 HStack(spacing: 8) {
+                    let range = device.tempRange
                     RoundIconButton(symbol: "minus", size: 32, help: "Decrease temperature") {
-                        ac.setTemp(device, state.setTemp - 0.5)
+                        ac.setTemp(device, state.setTemp - range.step)
                     }
-                    .disabled(state.setTemp <= 16)
+                    .disabled(state.setTemp <= range.min)
                     RoundIconButton(symbol: "plus", size: 32, help: "Increase temperature") {
-                        ac.setTemp(device, state.setTemp + 0.5)
+                        ac.setTemp(device, state.setTemp + range.step)
                     }
-                    .disabled(state.setTemp >= 30)
+                    .disabled(state.setTemp >= range.max)
                 }
             }
         }
@@ -217,7 +224,7 @@ struct ACCard: View {
     private var controls: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 4) {
-                ForEach(ACStore.modes, id: \.self) { mode in
+                ForEach(device.modeOptions, id: \.self) { mode in
                     OptionTile(
                         title: mode.capitalized,
                         symbol: ACModeStyle.symbol(mode),
@@ -237,7 +244,7 @@ struct ACCard: View {
                     .frame(width: 16)
                     .accessibilityHidden(true)
                 HStack(spacing: 4) {
-                    ForEach(ACStore.fanSpeeds, id: \.self) { speed in
+                    ForEach(device.fanOptions, id: \.self) { speed in
                         OptionTile(
                             title: ACModeStyle.fanTitle(speed),
                             symbol: "",

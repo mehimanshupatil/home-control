@@ -18,6 +18,7 @@ import `in`.canvs.homecontrol.miraie.CapKind
 import `in`.canvs.homecontrol.miraie.CapabilityCatalog
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -85,10 +86,28 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import `in`.canvs.homecontrol.miraie.AC_MODES
 import `in`.canvs.homecontrol.miraie.AcRepository
 import `in`.canvs.homecontrol.miraie.AcState
-import `in`.canvs.homecontrol.miraie.FAN_SPEEDS
+import `in`.canvs.homecontrol.miraie.AcProfile
+import `in`.canvs.homecontrol.miraie.TimerMath
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.material.icons.outlined.Bookmark
+import androidx.compose.material.icons.outlined.Timer
+import androidx.compose.material.icons.outlined.Warning
+import androidx.compose.material.icons.outlined.CleaningServices
+import androidx.compose.material.icons.filled.SignalWifi4Bar
+import androidx.compose.material.icons.filled.NetworkWifi2Bar
+import androidx.compose.material.icons.filled.NetworkWifi1Bar
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.Slider
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import java.text.DateFormat
+import java.util.Date
 import `in`.canvs.homecontrol.miraie.Transport
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -161,14 +180,14 @@ fun AcScreen(
                 ) { scope.launch { repo.refresh(forceCloud = true) } }
             }
         }
-        items(state.devices, key = { it.device.deviceId }) { ac -> AcCard(ac, repo) }
+        items(state.devices, key = { it.device.deviceId }) { ac -> AcCard(ac, repo, state.profiles[ac.device.deviceId].orEmpty()) }
         if (showDiagnostics) item { DiagnosticsCard(repo, state.devices, onHideDiagnostics) }
         if (showKeys) item { KeysCard(repo, state.devices, onHideKeys) }
     }
 }
 
 @Composable
-private fun AcCard(ac: AcState, repo: AcRepository) {
+private fun AcCard(ac: AcState, repo: AcRepository, profiles: List<AcProfile>) {
     val id = ac.device.deviceId
     val tint = ModeStyle.tint(ac.mode)
     HomeCard(tint = if (ac.power) tint else null) {
@@ -214,11 +233,11 @@ private fun AcCard(ac: AcState, repo: AcRepository) {
                     }
                 }
                 Row {
-                    RoundIconButton(Icons.Filled.Remove, "Decrease temperature", size = 40.dp, enabled = ac.temperature > 16.0) {
-                        repo.setTemperature(id, ac.temperature - 0.5)
+                    RoundIconButton(Icons.Filled.Remove, "Decrease temperature", size = 40.dp, enabled = ac.temperature > ac.core.tempMin) {
+                        repo.setTemperature(id, ac.temperature - ac.core.tempStep)
                     }
-                    RoundIconButton(Icons.Filled.Add, "Increase temperature", size = 40.dp, enabled = ac.temperature < 30.0) {
-                        repo.setTemperature(id, ac.temperature + 0.5)
+                    RoundIconButton(Icons.Filled.Add, "Increase temperature", size = 40.dp, enabled = ac.temperature < ac.core.tempMax) {
+                        repo.setTemperature(id, ac.temperature + ac.core.tempStep)
                     }
                 }
             }
@@ -230,7 +249,7 @@ private fun AcCard(ac: AcState, repo: AcRepository) {
 
         // Mode tiles
         Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-            AC_MODES.forEach { mode ->
+            ac.core.modes.forEach { mode ->
                 OptionTile(
                     title = mode.replaceFirstChar { it.uppercase() },
                     selected = ac.mode == mode,
@@ -248,7 +267,7 @@ private fun AcCard(ac: AcState, repo: AcRepository) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
             Icon(Icons.Outlined.Air, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(18.dp))
             Spacer(Modifier.width(2.dp))
-            FAN_SPEEDS.forEach { speed ->
+            ac.core.fanSpeeds.forEach { speed ->
                 OptionTile(
                     title = ModeStyle.fanTitle(speed),
                     selected = ac.fanSpeed == speed,
@@ -259,36 +278,233 @@ private fun AcCard(ac: AcState, repo: AcRepository) {
             }
         }
 
+        TimerRow(ac, repo)
+        ProfilesRow(ac, repo, profiles)
         MoreSection(ac, repo, tint)
     }
 }
 
-/** Status values the model reports (humidity, filter, PM2.5, power, faults). Only present values are shown. */
+// ---- timer ---------------------------------------------------------------------------------------
+
+private val TIMER_PRESETS = listOf(30 to "30 min", 60 to "1 h", 120 to "2 h", 240 to "4 h", 480 to "8 h")
+
+/** Off timer while the AC is on, on timer while it's off. Active timers show as pills with Cancel. */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun TimerRow(ac: AcState, repo: AcRepository) {
+    val timer = ac.core.timer ?: return
+    val id = ac.device.deviceId
+    val now = System.currentTimeMillis() / 1000
+    val (offUtc, onUtc) = TimerMath.parseStatus(ac.rawStatus[timer.key])
+    var custom by remember { mutableStateOf(false) }
+    val offSlot = ac.power
+    val presets = TIMER_PRESETS.filter { it.first in timer.minMinutes..timer.maxMinutes }
+
+    Column(Modifier.fillMaxWidth().padding(top = 8.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Outlined.Timer, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(16.dp))
+            Spacer(Modifier.width(6.dp))
+            Text(
+                if (offSlot) "Turn off in…" else "Turn on in…",
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Spacer(Modifier.height(4.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            presets.forEach { (minutes, label) ->
+                OptionTile(label, selected = false, modifier = Modifier.weight(1f)) { repo.setTimer(id, offSlot, minutes) }
+            }
+            OptionTile("Custom", selected = false, modifier = Modifier.weight(1.3f)) { custom = true }
+        }
+        val active = buildList {
+            if (TimerMath.remaining(offUtc, now) > 0) add(true to offUtc)
+            if (TimerMath.remaining(onUtc, now) > 0) add(false to onUtc)
+        }
+        if (active.isNotEmpty()) {
+            Spacer(Modifier.height(6.dp))
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                active.forEach { (isOff, utc) ->
+                    val time = DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(utc * 1000))
+                    Row(
+                        Modifier
+                            .clip(RoundedCornerShape(50))
+                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f))
+                            .padding(start = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            (if (isOff) "Off at " else "On at ") + time,
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        TextButton(onClick = { repo.setTimer(id, isOff, -1) }) { Text("Cancel") }
+                    }
+                }
+            }
+        }
+    }
+
+    if (custom) {
+        val steps = ((timer.maxMinutes - timer.minMinutes) / timer.stepMinutes).coerceAtLeast(1)
+        var value by remember { mutableFloatStateOf(60f.coerceIn(timer.minMinutes.toFloat(), timer.maxMinutes.toFloat())) }
+        AlertDialog(
+            onDismissRequest = { custom = false },
+            title = { Text(if (offSlot) "Turn off in" else "Turn on in") },
+            text = {
+                Column {
+                    Text(durationLabel(value.toInt()), style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
+                    Slider(
+                        value = value,
+                        onValueChange = { value = it },
+                        valueRange = timer.minMinutes.toFloat()..timer.maxMinutes.toFloat(),
+                        steps = steps - 1,
+                        modifier = Modifier.semantics { contentDescription = "Timer duration" },
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { repo.setTimer(id, offSlot, value.toInt()); custom = false }) { Text("Set timer") }
+            },
+            dismissButton = { TextButton(onClick = { custom = false }) { Text("Cancel") } },
+        )
+    }
+}
+
+private fun durationLabel(minutes: Int): String {
+    val h = minutes / 60
+    val m = minutes % 60
+    return when {
+        h == 0 -> "$m min"
+        m == 0 -> "$h h"
+        else -> "$h h $m min"
+    }
+}
+
+// ---- profiles ------------------------------------------------------------------------------------
+
+/** Saved local profiles: tap to apply, long-press to delete. */
+@OptIn(ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
+@Composable
+private fun ProfilesRow(ac: AcState, repo: AcRepository, profiles: List<AcProfile>) {
+    if (profiles.isEmpty()) return
+    val haptics = LocalHapticFeedback.current
+    var deleting by remember { mutableStateOf<AcProfile?>(null) }
+    Column(Modifier.fillMaxWidth().padding(top = 8.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Outlined.Bookmark, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(16.dp))
+            Spacer(Modifier.width(6.dp))
+            Text("Profiles", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Spacer(Modifier.height(4.dp))
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            profiles.forEach { p ->
+                Box(
+                    Modifier
+                        .height(40.dp)
+                        .clip(RoundedCornerShape(Metrics.tileRadius))
+                        .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f))
+                        .combinedClickable(
+                            onClick = { repo.applyProfile(ac.device.deviceId, p) },
+                            onLongClick = { haptics.performHapticFeedback(HapticFeedbackType.LongPress); deleting = p },
+                            onLongClickLabel = "Delete profile",
+                        )
+                        .padding(horizontal = 14.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(p.name, style = MaterialTheme.typography.labelLarge)
+                }
+            }
+        }
+    }
+    deleting?.let { p ->
+        AlertDialog(
+            onDismissRequest = { deleting = null },
+            title = { Text("Delete “${p.name}”?") },
+            text = { Text("This profile is removed from this phone only.") },
+            confirmButton = { TextButton(onClick = { repo.deleteProfile(ac.device.deviceId, p.name); deleting = null }) { Text("Delete") } },
+            dismissButton = { TextButton(onClick = { deleting = null }) { Text("Cancel") } },
+        )
+    }
+}
+
+@Composable
+private fun SaveProfileButton(ac: AcState, repo: AcRepository) {
+    var naming by remember { mutableStateOf(false) }
+    var name by remember { mutableStateOf("") }
+    TextButton(onClick = { name = ""; naming = true }) {
+        Icon(Icons.Outlined.Bookmark, null, modifier = Modifier.size(16.dp))
+        Spacer(Modifier.width(6.dp))
+        Text("Save as profile")
+    }
+    if (naming) {
+        AlertDialog(
+            onDismissRequest = { naming = false },
+            title = { Text("Save profile") },
+            text = {
+                Column {
+                    Text(
+                        "Saves power, mode, temperature, fan, swing and display.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(name, { name = it }, singleLine = true, label = { Text("Name, e.g. Night") })
+                }
+            },
+            confirmButton = {
+                TextButton(enabled = name.isNotBlank(), onClick = { repo.saveProfile(ac.device.deviceId, name); naming = false }) { Text("Save") }
+            },
+            dismissButton = { TextButton(onClick = { naming = false }) { Text("Cancel") } },
+        )
+    }
+}
+
+/**
+ * Status info from real status keys (PROTOCOL.md §1.8): Wi-Fi signal, filter, errors, warnings,
+ * plus humidity / PM2.5 / power only when the model lists them and the AC reports them.
+ */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun InfoRow(ac: AcState) {
-    val items = ac.capabilities.filter { it.kind == CapKind.Status }.mapNotNull { spec ->
-        val v = ac.statusOf(spec) ?: return@mapNotNull null
-        val text = v.toString().trim()
-        when (spec.name) {
-            "ACFaults" -> if (isFault(text)) Triple(Icons.Filled.ErrorOutline, "Fault $text", true) else null
-            "RoomHumidity" -> Triple(Icons.Outlined.WaterDrop, "${num(text)}% humidity", false)
-            "FilterDustLevel" -> Triple(Icons.Outlined.FilterAlt, "Filter $text", false)
-            "TimeBasedFilterHealth" -> Triple(Icons.Outlined.FilterAlt, "Filter health $text", false)
-            "PM25Sensor" -> Triple(Icons.Outlined.Grain, "PM2.5 ${num(text)}", false)
-            "CurrentPowerConsumption" -> Triple(Icons.Outlined.Bolt, "${num(text)} W", false)
-            else -> null
+    val st = ac.rawStatus
+    data class Chip(val icon: ImageVector, val text: String, val color: Color? = null)
+    val chips = buildList {
+        st["errors"]?.toString()?.trim()?.takeIf { isFault(it) }?.let { add(Chip(Icons.Filled.ErrorOutline, "Error $it", Color(0xFFFF3B30))) }
+        st["warnings"]?.toString()?.trim()?.takeIf { isFault(it) }?.let { add(Chip(Icons.Outlined.Warning, "Warning $it", Color(0xFFFF9500))) }
+        if (st["filterCleaningRequired"]?.toString().equals("true", ignoreCase = true)) {
+            val level = st["filterDustLevel"]?.toString()?.toDoubleOrNull()?.toInt()?.takeIf { it > 0 }
+            add(Chip(Icons.Outlined.CleaningServices, "Clean filter" + (level?.let { " · level $it" } ?: ""), Color(0xFFFF9500)))
+        } else {
+            st["filterDustLevel"]?.toString()?.toDoubleOrNull()?.toInt()?.takeIf { it > 0 }?.let { add(Chip(Icons.Outlined.FilterAlt, "Filter level $it")) }
+        }
+        ac.capabilities.filter { it.kind == CapKind.Status }.forEach { spec ->
+            val text = ac.statusOf(spec)?.toString()?.trim() ?: return@forEach
+            when (spec.name) {
+                "RoomHumidity" -> add(Chip(Icons.Outlined.WaterDrop, "${num(text)}% humidity"))
+                "PM25Sensor" -> add(Chip(Icons.Outlined.Grain, "PM2.5 ${num(text)}"))
+                "CurrentPowerConsumption" -> add(Chip(Icons.Outlined.Bolt, "${num(text)} W"))
+            }
+        }
+        st["rssi"]?.toString()?.toDoubleOrNull()?.toInt()?.let { rssi ->
+            val (icon, label) = when {
+                rssi >= -60 -> Icons.Filled.SignalWifi4Bar to "Strong"
+                rssi >= -72 -> Icons.Filled.NetworkWifi2Bar to "Fair"
+                else -> Icons.Filled.NetworkWifi1Bar to "Weak"
+            }
+            add(Chip(icon, "Wi-Fi $label ($rssi dBm)"))
         }
     }
-    if (items.isEmpty()) return
+    if (chips.isEmpty()) return
     FlowRow(
         Modifier.fillMaxWidth().padding(top = 6.dp),
         horizontalArrangement = Arrangement.spacedBy(6.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        items.forEach { (icon, text, isError) ->
-            if (isError) {
-                StatusPill(text, Color(0xFFFF3B30), icon)
+        chips.forEach { c ->
+            if (c.color != null) {
+                StatusPill(c.text, c.color, c.icon)
             } else {
                 Row(
                     Modifier
@@ -297,9 +513,9 @@ private fun InfoRow(ac: AcState) {
                         .padding(horizontal = 8.dp, vertical = 4.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Icon(icon, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(14.dp))
+                    Icon(c.icon, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(14.dp))
                     Spacer(Modifier.width(4.dp))
-                    Text(text, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(c.text, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
         }
@@ -387,7 +603,11 @@ private fun MoreSection(ac: AcState, repo: AcRepository, tint: Color) {
                     }
                 }
             }
+            val cleaning = ac.spec("EvaporatorClean")?.let { ac.statusOf(it)?.toString().equals("on", ignoreCase = true) } == true
+            val lastSwing = controls.lastOrNull { it.name == "VerticalSwing" || it.name == "HorizontalSwing" }?.name
             controls.filter { it.kind == CapKind.IntChoice }.forEach { spec ->
+                val isSwing = spec.name == "VerticalSwing" || spec.name == "HorizontalSwing"
+                val locked = isSwing && cleaning
                 // Up to 6 options fit one row; longer sets split evenly over rows (no orphans).
                 val n = spec.intValues.size
                 val perRow = if (n <= 6) n.coerceAtLeast(1) else (n + 1) / 2
@@ -399,13 +619,22 @@ private fun MoreSection(ac: AcState, repo: AcRepository, tint: Color) {
                                 selected = CapabilityCatalog.matches(spec, option, ac.statusOf(spec)),
                                 tint = tint,
                                 muted = !ac.power,
+                                enabled = !locked,
                                 modifier = Modifier.weight(1f),
                             ) { repo.sendRaw(id, spec.key, CapabilityCatalog.payload(spec, option), spec.ki) }
                         }
                         repeat(perRow - chunk.size) { Spacer(Modifier.weight(1f)) }
                     }
                 }
+                if (locked && spec.name == lastSwing) {
+                    Text(
+                        "Swing is locked while Clean runs",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
+            SaveProfileButton(ac, repo)
         }
     }
 }
@@ -469,6 +698,8 @@ private fun DiagnosticsCard(repo: AcRepository, devices: List<AcState>, onHide: 
                             ?: "unknown",
                     )
                     KeyRow("Link", ac.transport.name + if (ac.udpSupported == false) " (no LAN support)" else "")
+                    KeyRow("LAN", (if (ac.localKeys != null) "key available" else "no key") + " · " + ac.lastLocalDiscovery)
+                    ac.rawStatus["V"]?.let { KeyRow("FW", it.toString()) }
                     KeyRow(
                         "Caps",
                         if (ac.modelJson == null) "model not loaded"

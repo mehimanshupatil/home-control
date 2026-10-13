@@ -45,6 +45,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.draw.shadow
@@ -142,6 +143,7 @@ fun OptionTile(
     icon: ImageVector? = null,
     tint: Color = MaterialTheme.colorScheme.primary,
     muted: Boolean = false,
+    enabled: Boolean = true,
     onClick: () -> Unit,
 ) {
     val fill = when {
@@ -159,7 +161,8 @@ fun OptionTile(
             .heightIn(min = if (icon != null) 56.dp else 40.dp)
             .clip(RoundedCornerShape(Metrics.tileRadius))
             .background(fill)
-            .pressable(onClick = onClick)
+            .alpha(if (enabled) 1f else 0.38f)
+            .pressable(enabled = enabled, onClick = onClick)
             .semantics { this.selected = selected }
             .padding(vertical = 6.dp, horizontal = 2.dp),
         horizontalAlignment = Alignment.CenterHorizontally,

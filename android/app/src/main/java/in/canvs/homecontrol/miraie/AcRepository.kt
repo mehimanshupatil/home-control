@@ -25,7 +25,11 @@ data class AcUiState(
     val error: String? = null,
     val cloudConnected: Boolean = false,
     val localOnly: Boolean = false,
+    /** Experimental LAN control for models without `udpControl`. */
+    val experimentalLocal: Boolean = false,
     val devices: List<AcState> = emptyList(),
+    /** Local profiles per device id. */
+    val profiles: Map<String, List<AcProfile>> = emptyMap(),
 )
 
 /**
@@ -44,12 +48,22 @@ class AcRepository(context: Context, private val store: SecureStore) {
         AcUiState(
             loggedIn = api.isLoggedIn || store.devicesCache != null,
             localOnly = store.localOnly,
+            experimentalLocal = store.experimentalLocal,
             devices = loadCache(),
-        ),
+        ).let { it.copy(profiles = it.devices.associate { d -> d.device.deviceId to loadProfiles(d.device.deviceId) }) },
     )
     val state: StateFlow<AcUiState> = _state.asStateFlow()
 
     private val localOnly get() = store.localOnly
+
+    /** Whether LAN control may be attempted for [d]: model supports it, or the experimental switch is on. */
+    private fun localAllowed(d: AcState) = d.udpSupported != false || store.experimentalLocal
+
+    fun setExperimentalLocal(enabled: Boolean) {
+        store.experimentalLocal = enabled
+        _state.update { it.copy(experimentalLocal = enabled) }
+        scope.launch { refresh() }
+    }
 
     suspend fun login(login: String, password: String) {
         _state.update { it.copy(loading = true, error = null) }
@@ -118,7 +132,13 @@ class AcRepository(context: Context, private val store: SecureStore) {
                 }
             }
             devices = selectTransports(devices)
-            _state.update { it.copy(loading = false, devices = devices) }
+            _state.update { s ->
+                s.copy(
+                    loading = false,
+                    devices = devices,
+                    profiles = devices.associate { d -> d.device.deviceId to loadProfiles(d.device.deviceId) },
+                )
+            }
 
             if (!localOnly && devices.any { it.transport == Transport.Cloud }) connectMqtt(devices)
         } catch (e: Exception) {
@@ -206,24 +226,34 @@ class AcRepository(context: Context, private val store: SecureStore) {
     fun clearError() = _state.update { it.copy(error = null) }
 
     /** Shareable JSON (see [Diagnostics]): no password, tokens or full LAN keys. */
-    fun diagnosticsJson(appVersion: String): String = Diagnostics.build(appVersion, _state.value.devices)
+    fun diagnosticsJson(appVersion: String): String = Diagnostics.build(appVersion, _state.value.devices, experimentalLocal = store.experimentalLocal)
 
-    /** Debug builds only: sample ACs for UI screenshots (`adb shell am start ... --ez demo true`). */
+    /** Debug builds only: sample ACs for UI screenshots (`adb shell am start ... --ez demo true`). Mirrors real model 130185. */
     fun seedDemo() {
-        fun dev(id: String, name: String, space: String) = MiraieDevice(id, name, null, "AC", "h/$id", "h", space)
+        fun dev(id: String, name: String, space: String, model: String?) = MiraieDevice(id, name, model, "AC", "h/$id", "h", space)
+        val now = System.currentTimeMillis() / 1000
+        val status = JSONObject(DEMO_STATUS).put("actm", JSONArray(listOf(now + 95 * 60, -1))).toMap()
+        val bedroom = AcState(
+            dev("d1", "Bedroom AC", "Bedroom", "130185"), transport = Transport.Cloud, udpSupported = false,
+            power = true, mode = "cool", temperature = 26.0, roomTemperature = 32.0, fanSpeed = "auto",
+            localKeys = LocalKeys("AA:BB:CC:DD:EE:FF", "192.168.1.50", "00112233445566778899aabbccddeeff", "0f0e0d0c0b0a09080706050403020100"),
+            rawStatus = status, lastLocalDiscovery = "not attempted",
+        ).withModel(DEMO_MODEL)
+        val living = AcState(
+            dev("d2", "Living Room AC", "Living Room", null), transport = Transport.Cloud, power = false, mode = "dry",
+            temperature = 25.5, roomTemperature = 30.0, fanSpeed = "low",
+        )
+        val profiles = listOf(
+            AcProfile("Night", true, "cool", 26.0, "quiet", 0, 0, "off"),
+            AcProfile("Quick cool", true, "cool", 22.0, "high", 1, 3, "on"),
+        )
         _state.value = AcUiState(
             loggedIn = true,
-            devices = listOf(
-                AcState(dev("d1", "Bedroom AC", "Bedroom"), transport = Transport.Local, power = true, mode = "cool",
-                    temperature = 24.0, roomTemperature = 28.0, fanSpeed = "auto",
-                    localKeys = LocalKeys("AA:BB:CC:DD:EE:FF", "192.168.1.50", "00112233445566778899aabbccddeeff", "0f0e0d0c0b0a09080706050403020100"),
-                    rawStatus = mapOf("ps" to "on", "acmd" to "cool", "actmp" to "24", "rmtmp" to "28", "rmhmd" to 62,
-                        "acfdl" to 2, "accpc" to 860, "acvs" to 0, "achs" to 3, "acdc" to "on", "acem" to "off",
-                        "acpm" to "on", "acec" to "off", "acng" to "on", "accnv" to 80, "acflt" to ""),
-                ).withModel(DEMO_MODEL),
-                AcState(dev("d2", "Living Room AC", "Living Room"), transport = Transport.Cloud, power = false, mode = "dry",
-                    temperature = 25.5, roomTemperature = 30.0, fanSpeed = "low"),
-            ),
+            cloudConnected = !store.localOnly,
+            localOnly = store.localOnly,
+            experimentalLocal = store.experimentalLocal,
+            devices = listOf(bedroom, living),
+            profiles = mapOf("d1" to profiles),
         )
     }
 
@@ -236,10 +266,87 @@ class AcRepository(context: Context, private val store: SecureStore) {
     fun setFanSpeed(deviceId: String, speed: String) =
         send(deviceId, Capability.FanSpeed, speed) { it.copy(fanSpeed = speed) }
 
+    /** Clamps to the model's range and step; sends "26.0" like the official app (`DecimalFormat("#.0")`). */
     fun setTemperature(deviceId: String, temp: Double) {
-        val clamped = temp.coerceIn(16.0, 30.0)
-        val text = if (clamped % 1.0 == 0.0) clamped.toInt().toString() else clamped.toString()
-        send(deviceId, Capability.Temperature, text) { it.copy(temperature = clamped) }
+        val core = _state.value.devices.firstOrNull { it.device.deviceId == deviceId }?.core ?: CoreSpec()
+        val stepped = Math.round((temp - core.tempMin) / core.tempStep) * core.tempStep + core.tempMin
+        val clamped = stepped.coerceIn(core.tempMin, core.tempMax)
+        send(deviceId, Capability.Temperature, formatTemperature(clamped)) { it.copy(temperature = clamped) }
+    }
+
+    /**
+     * Sets ([minutes] > 0) or cancels ([minutes] = -1) the off or on timer, keeping the other slot.
+     * Payload is relative seconds; status is UTC seconds (PROTOCOL.md §1.8).
+     */
+    fun setTimer(deviceId: String, offSlot: Boolean, minutes: Int) {
+        val ac = _state.value.devices.firstOrNull { it.device.deviceId == deviceId } ?: return
+        val timer = ac.core.timer ?: return
+        val now = System.currentTimeMillis() / 1000
+        val payload = TimerMath.payload(offSlot, if (minutes > 0) minutes * 60L else -1L, ac.rawStatus[timer.key], now)
+        val utc = JSONArray(TimerMath.toUtc(payload, now))
+        sendKey(deviceId, timer.key, TimerSpec.KI, JSONArray(payload), statusValue = utc) { it }
+    }
+
+    // ---- local profiles -------------------------------------------------------------------------
+
+    /** Saves the AC's current settings as a named profile (replaces one with the same name). */
+    fun saveProfile(deviceId: String, name: String) {
+        val ac = _state.value.devices.firstOrNull { it.device.deviceId == deviceId } ?: return
+        fun int(spec: String) = ac.spec(spec)?.let { ac.statusOf(it)?.toString()?.toDoubleOrNull()?.toInt() }
+        val profile = AcProfile(
+            name = name.trim(),
+            power = ac.power,
+            mode = ac.mode,
+            temperature = ac.temperature,
+            fanSpeed = ac.fanSpeed,
+            verticalSwing = int("VerticalSwing"),
+            horizontalSwing = int("HorizontalSwing"),
+            display = ac.spec("DisplayControl")?.let { ac.statusOf(it)?.toString() },
+        )
+        writeProfiles(deviceId, loadProfiles(deviceId).filter { it.name != profile.name } + profile)
+    }
+
+    fun deleteProfile(deviceId: String, name: String) =
+        writeProfiles(deviceId, loadProfiles(deviceId).filter { it.name != name })
+
+    /** Applies a profile: only differing settings, ~300 ms apart; power first when turning on, last when turning off. */
+    fun applyProfile(deviceId: String, profile: AcProfile) {
+        scope.launch {
+            val ac = _state.value.devices.firstOrNull { it.device.deviceId == deviceId } ?: return@launch
+            val steps = mutableListOf<() -> Unit>()
+            if (profile.power && !ac.power) steps += { setPower(deviceId, true) }
+            if (profile.power) {
+                profile.mode?.takeIf { it != ac.mode && it in ac.core.modes }?.let { steps += { setMode(deviceId, it) } }
+                profile.temperature?.takeIf { it != ac.temperature }?.let { steps += { setTemperature(deviceId, it) } }
+                profile.fanSpeed?.takeIf { it != ac.fanSpeed && it in ac.core.fanSpeeds }?.let { steps += { setFanSpeed(deviceId, it) } }
+                fun intStep(specName: String, value: Int?) {
+                    val spec = ac.spec(specName) ?: return
+                    if (value == null || ac.statusOf(spec)?.toString()?.toDoubleOrNull()?.toInt() == value) return
+                    steps += { sendRaw(deviceId, spec.key, value, spec.ki) }
+                }
+                intStep("VerticalSwing", profile.verticalSwing)
+                intStep("HorizontalSwing", profile.horizontalSwing)
+                ac.spec("DisplayControl")?.let { spec ->
+                    profile.display?.takeIf { it != ac.statusOf(spec)?.toString() }?.let { v -> steps += { sendRaw(deviceId, spec.key, v, spec.ki) } }
+                }
+            } else if (ac.power) {
+                steps += { setPower(deviceId, false) }
+            }
+            steps.forEachIndexed { i, step ->
+                if (i > 0) delay(300)
+                step()
+            }
+        }
+    }
+
+    private fun loadProfiles(deviceId: String): List<AcProfile> = runCatching {
+        val arr = JSONArray(store.acProfiles(deviceId) ?: return emptyList())
+        (0 until arr.length()).map { AcProfile.fromJson(arr.getJSONObject(it)) }.filter { it.name.isNotEmpty() }
+    }.getOrDefault(emptyList())
+
+    private fun writeProfiles(deviceId: String, list: List<AcProfile>) {
+        store.setAcProfiles(deviceId, JSONArray(list.map { it.toJson() }).toString())
+        _state.update { it.copy(profiles = it.profiles + (deviceId to list)) }
     }
 
     // ---- cloud bootstrap -------------------------------------------------------------------------
@@ -272,23 +379,32 @@ class AcRepository(context: Context, private val store: SecureStore) {
     // ---- transport selection --------------------------------------------------------------------
 
     private suspend fun selectTransports(devices: List<AcState>): List<AcState> = withContext(Dispatchers.IO) {
-        val localCandidates = devices.filter { it.localKeys != null && it.udpSupported != false }
+        val localCandidates = devices.filter { it.localKeys != null && localAllowed(it) }
         val localStarted = localCandidates.isNotEmpty() && runCatching { local.start() }.isSuccess
         devices.map { d ->
             async {
-                val ip = if (localStarted && d.localKeys != null && d.udpSupported != false) {
-                    local.register(d.device.deviceId, d.localKeys)
+                val attempt = localStarted && d.localKeys != null && localAllowed(d)
+                val ip = if (attempt) {
+                    local.register(d.device.deviceId, d.localKeys!!)
                     local.discover(d.device.deviceId, timeoutMs = 3000)
                 } else {
                     null
                 }
+                val discovery = when {
+                    !localAllowed(d) -> "not attempted"
+                    d.localKeys == null -> "no key"
+                    !attempt -> "not attempted"
+                    ip != null -> "answered"
+                    else -> "timeout"
+                }
+                val base = d.copy(lastLocalDiscovery = discovery)
                 when {
                     ip != null -> {
                         persistIp(d.device.deviceId, ip)
-                        d.copy(transport = Transport.Local, online = true)
+                        base.copy(transport = Transport.Local, online = true)
                     }
-                    localOnly -> d.copy(transport = Transport.Offline)
-                    else -> d.copy(transport = Transport.Cloud)
+                    localOnly -> base.copy(transport = Transport.Offline)
+                    else -> base.copy(transport = Transport.Cloud)
                 }
             }
         }.awaitAll()
@@ -302,7 +418,7 @@ class AcRepository(context: Context, private val store: SecureStore) {
         sendKey(deviceId, key, ki, value) { applyStatus(it, JSONObject().put(key, value)) }
 
     private fun send(deviceId: String, cap: Capability, value: Any, optimistic: (AcState) -> AcState) =
-        sendKey(deviceId, null, cap.ki, value, cap, optimistic)
+        sendKey(deviceId, null, cap.ki, value, cap, optimistic = optimistic)
 
     private fun sendKey(
         deviceId: String,
@@ -310,11 +426,12 @@ class AcRepository(context: Context, private val store: SecureStore) {
         ki: Int,
         value: Any,
         cap: Capability? = null,
+        statusValue: Any = value,
         optimistic: (AcState) -> AcState,
     ) {
         val ac = _state.value.devices.firstOrNull { it.device.deviceId == deviceId } ?: return
         val key = rawKey ?: ac.key(cap!!)
-        updateDevice(deviceId) { optimistic(it).copy(rawStatus = it.rawStatus + (key to value)) }
+        updateDevice(deviceId) { optimistic(it).let { o -> o.copy(rawStatus = o.rawStatus + (key to statusValue)) } }
         scope.launch {
             try {
                 when {
@@ -533,24 +650,37 @@ class AcRepository(context: Context, private val store: SecureStore) {
 
 }
 
-/** Debug demo model: shapes follow MirAIe's capability attribute classes. */
+/** Debug demo model: the real model 130185 from user diagnostics (PROTOCOL.md §1.8). */
 private val DEMO_MODEL = """
-{"modelId":"demo","controlCapabilities":[
- {"capability":"PowerStatus","attributes":[{"key":"ps","values":["on","off"]}]},
- {"capability":"VerticalSwing","attributes":[{"key":"acvs","range":{"min":[{"value":0}],"max":[{"value":5}],"increment":[{"value":1}]}}]},
- {"capability":"HorizontalSwing","attributes":[{"key":"achs","range":{"min":[{"value":0}],"max":[{"value":5}],"increment":[{"value":1}]}}]},
- {"capability":"DisplayControl","attributes":[{"key":"acdc","values":["on","night","off"]}]},
+{"modelId":"130185","configCapabilities":[{"capability":"ProximityNotification"}],
+ "controlCapabilities":[
+ {"capability":"ACFanSpeed","attributes":[{"key":"acfs","values":["auto","quiet","low","medium","high"]}]},
+ {"capability":"ACMode","attributes":[{"key":"acmd","values":["auto","cool","dry","fan"]}]},
+ {"capability":"ACTemperature","attributes":[{"key":"actmp","range":{"increment":[{"unit":"celcius","value":1},{"unit":"fahrenheit","value":1}],"max":[{"unit":"celcius","value":30},{"unit":"fahrenheit","value":86}],"min":[{"unit":"celcius","value":16},{"unit":"fahrenheit","value":61}]}}]},
+ {"capability":"ACTimer","attributes":[{"key":"actm","range":{"increment":[{"value":10}],"max":[{"value":1440}],"min":[{"value":10}]}}]},
+ {"capability":"Convertible","attributes":[{"intValues":[110,100,90,80,70,55,40,0],"key":"cnv"}]},
+ {"capability":"DisplayControl","attributes":[{"key":"acdc","values":["on","off"]}]},
  {"capability":"ECOMode","attributes":[{"key":"acem","values":["on","off"]}]},
- {"capability":"PowerfulMode","attributes":[{"key":"acpm","values":["on","off"]}]},
- {"capability":"EvaporatorClean","attributes":[{"key":"acec","values":["on","off"]}]},
- {"capability":"NanoeG","attributes":[{"key":"acng","values":["on","off"]}]},
- {"capability":"Convertible","attributes":[{"key":"accnv","values":["40","50","60","70","80","90","100","110"]}]}],
- "statusCapabilitiesV2":[
- {"capability":"RoomHumidity","attributes":[{"key":"rmhmd"}]},
- {"capability":"FilterDustLevel","attributes":[{"key":"acfdl"}]},
- {"capability":"CurrentPowerConsumption","attributes":[{"key":"accpc"}]},
- {"capability":"ACFaults","attributes":[{"key":"acflt"}]}]}
+ {"capability":"EvaporatorClean","attributes":[{"key":"acec"}]},
+ {"capability":"HorizontalSwing","attributes":[{"key":"achs","range":{"increment":[{"value":1}],"max":[{"value":5}],"min":[{"value":0}]}}]},
+ {"capability":"PowerStatus","attributes":[{"key":"ps"}]},
+ {"capability":"PowerfulMode","attributes":[{"key":"acpm"}]},
+ {"capability":"SleepProfile","attributes":[{"key":"acsp"}]},
+ {"capability":"TimeBasedFilterHealth","attributes":[{"key":"acfh"}]},
+ {"capability":"VerticalSwing","attributes":[{"key":"acvs","range":{"increment":[{"value":1}],"max":[{"value":5}],"min":[{"value":0}]}}]},
+ {"capability":"BuzzerControl","attributes":[{"key":"bzr","minFwVersion":3.02,"values":["on","off"]}]}],
+ "statusCapabilitiesV2":[{"capability":"ACFaults"},{"capability":"PowerConsumption"}]}
 """
+
+/** Debug demo status: real keys from user diagnostics (actm is set at seed time). */
+private val DEMO_STATUS = """
+{"V":"3.02","acdc":"on","acec":"off","acem":"off","acfs":"auto","achs":0,"acmd":"cool","acpm":"off","acsp":"none",
+ "actmp":"26.0","acvs":0,"bzr":"on","cnv":0,"errors":"","warnings":"","filterCleaningRequired":true,"filterDustLevel":2,
+ "onlineStatus":"true","ps":"on","rmtmp":"32.0","rssi":-56,"ty":"AC"}
+"""
+
+/** Official temperature format (`DecimalFormat("#.0")`): "26.0", "24.5". */
+internal fun formatTemperature(t: Double): String = String.format(java.util.Locale.US, "%.1f", t)
 
 /** org.json → Kotlin map (values kept as org.json types). */
 private fun JSONObject.toMap(): Map<String, Any?> = keys().asSequence().associateWith { k -> opt(k)?.takeIf { it != JSONObject.NULL } }

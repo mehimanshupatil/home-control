@@ -32,6 +32,12 @@ Status from every source (UDP packets, MQTT `<topic>/status`, REST `mobile/statu
 
 The device model's `controlCapabilities` / `statusCapabilitiesV2` are parsed into capability descriptors: name, wire key, `ki`, kind (toggle / choice / int-choice / range / status) and allowed values. The UI renders only what the model lists. Mappings that aren't in the model (Convertible ints, ACGenMode 40→5 … 110→1, Display on/night/off) are taken from the decompiled enums; see PROTOCOL.md §1.7.
 
+## Timers and profiles (Mac; Android pending)
+
+- **Timer** (`ACTimer`, shown only when the model lists it): the app sends `[offSeconds, onSeconds]` relative to now, with -1 for unset. It keeps the other slot as its remaining time, read from the status `actm` (UTC epoch seconds). Presets and the custom stepper use the model range (10–1440 min, step 10).
+- **Profiles** are stored per AC in UserDefaults (`acProfiles-<deviceId>`). Applying one sends only the settings that differ, as separate commands about 300 ms apart: power first when turning on, and only power when the profile turns the AC off.
+- **Try local control (experimental):** off by default. When on, the app fetches LAN keys and runs discovery even for models without `udpControl`. Diagnostics record `lanKeyAvailable` and `lastLocalDiscovery`.
+
 ## WiZ
 
 Stateless UDP JSON-RPC. Discovery broadcasts `getPilot` and collects replies keyed by MAC; control is `setPilot` to the bulb's IP with retries. Names are stored locally (bulbs don't carry the WiZ app's names). Identify blinks the bulb using `setPilot` only.
@@ -60,7 +66,7 @@ Stateless UDP JSON-RPC. Discovery broadcasts `getPilot` and collects replies key
 | `LightsStore.swift`, `WizUDP.swift`, `LightsViews.swift` | WiZ state, UDP JSON-RPC, bulb cards |
 | `Theme.swift` | Design tokens and shared components (card, tiles, pills, press style, transitions) |
 | `Keychain.swift`, `StateCompat.swift` | Keychain wrapper; `@ViewState` alias (see AGENTS.md) |
-| `Snapshot.swift` | DEBUG-only renderer to PNG plus self-checks (key round trip, diagnostics redaction) |
+| `Snapshot.swift` | DEBUG-only renderer to PNG plus self-checks (key round trip, diagnostics redaction, model parsing, timer payload). Runs with sample data and never touches the real session. |
 
 ### android/ (single module `app`, package `in.canvs.homecontrol`)
 | File | Role |

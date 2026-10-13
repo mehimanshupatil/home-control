@@ -60,14 +60,51 @@ data class AcState(
     val modelJson: String? = null,
     /** Extra capabilities the model lists, parsed from [modelJson]. */
     val capabilities: List<CapabilitySpec> = CapabilityCatalog.parse(modelJson),
+    /** Core control options (modes, fan speeds, temperature range, timer) from [modelJson]. */
+    val core: CoreSpec = CapabilityCatalog.core(modelJson),
+    /** Result of the last LAN discovery attempt: answered / timeout / no key / not attempted. */
+    val lastLocalDiscovery: String = "not attempted",
     /** Latest status fields merged from REST, MQTT and local UDP (raw keys → values). */
     val rawStatus: Map<String, Any?> = emptyMap(),
 ) {
     fun key(c: Capability): String = keys[c] ?: c.defaultKey
 
     /** Sets the model JSON and re-derives [capabilities] (data-class `copy` would not). */
-    fun withModel(json: String?): AcState = copy(modelJson = json, capabilities = CapabilityCatalog.parse(json))
+    fun withModel(json: String?): AcState =
+        copy(modelJson = json, capabilities = CapabilityCatalog.parse(json), core = CapabilityCatalog.core(json))
 
     /** Raw status value for a capability's key, if the AC has reported it. */
     fun statusOf(spec: CapabilitySpec): Any? = rawStatus[spec.key]
+
+    /** Extra capability by model name (e.g. "VerticalSwing"), if the model lists it. */
+    fun spec(name: String): CapabilitySpec? = capabilities.firstOrNull { it.name == name }
+}
+
+/** A saved set of AC settings (local profile). Null fields are left unchanged when applied. */
+data class AcProfile(
+    val name: String,
+    val power: Boolean,
+    val mode: String?,
+    val temperature: Double?,
+    val fanSpeed: String?,
+    val verticalSwing: Int?,
+    val horizontalSwing: Int?,
+    val display: String?,
+) {
+    fun toJson(): org.json.JSONObject = org.json.JSONObject()
+        .put("name", name).put("power", power).put("mode", mode).put("temp", temperature).put("fan", fanSpeed)
+        .put("vs", verticalSwing).put("hs", horizontalSwing).put("display", display)
+
+    companion object {
+        fun fromJson(o: org.json.JSONObject) = AcProfile(
+            name = o.optString("name"),
+            power = o.optBoolean("power", true),
+            mode = o.optString("mode").ifEmpty { null },
+            temperature = o.optDouble("temp").takeIf { !it.isNaN() },
+            fanSpeed = o.optString("fan").ifEmpty { null },
+            verticalSwing = if (o.has("vs")) o.optInt("vs") else null,
+            horizontalSwing = if (o.has("hs")) o.optInt("hs") else null,
+            display = o.optString("display").ifEmpty { null },
+        )
+    }
 }

@@ -136,9 +136,14 @@ struct ACCapability: Identifiable, Equatable {
         case "VerticalSwing", "HorizontalSwing":
             kind = .intChoice(swingOptions(name: name, ints: ints, range: attr?["range"]))
         case "Convertible":
-            let values = strings.isEmpty ? convertibleDefaults : strings
-            kind = .intChoice(values.map { v in
-                v.uppercased() == "OFF" ? IntOption(value: 0, label: "Off") : IntOption(value: Int(v) ?? 0, label: "\(v)%")
+            // Prefer the model's `intValues` (e.g. [110,100,90,80,70,55,40,0]); fall back to strings, then defaults.
+            var values = ints
+            if values.isEmpty {
+                values = (strings.isEmpty ? convertibleDefaults : strings).map { $0.uppercased() == "OFF" ? 0 : Int($0) ?? 0 }
+            }
+            let ordered = values.filter { $0 > 0 }.sorted() + (values.contains(0) ? [0] : [])
+            kind = .intChoice(ordered.map { v in
+                v == 0 ? IntOption(value: 0, label: "Off") : IntOption(value: v, label: "\(v)%")
             })
         case "ACGenMode":
             let values = strings.isEmpty ? ["40", "60", "80", "100", "110", "OFF"] : strings
@@ -176,4 +181,69 @@ struct ACCapability: Identifiable, Equatable {
             return IntOption(value: v, label: label)
         }
     }
+}
+
+// MARK: Model-derived core ranges
+
+/// Numeric range from a model attribute (`range.min/max/increment`, each a list of `{unit, value}`).
+struct ACRange: Equatable {
+    var min: Double
+    var max: Double
+    var step: Double
+}
+
+extension ACCapability {
+    /// First attribute of the named capability in a stored model blob.
+    static func attribute(_ name: String, in model: JSONValue?) -> JSONValue? {
+        for field in ["controlCapabilities", "statusCapabilitiesV2"] {
+            for cap in model?[field]?.arrayValue ?? [] where cap["capability"]?.stringValue == name {
+                return cap["attributes"]?.arrayValue.first
+            }
+        }
+        return nil
+    }
+
+    /// Reads `min`/`max`/`increment`, preferring the Celsius entry (the model spells it "celcius").
+    static func range(_ name: String, in model: JSONValue?) -> ACRange? {
+        guard let r = attribute(name, in: model)?["range"] else { return nil }
+        func pick(_ field: String) -> Double? {
+            let entries = r[field]?.arrayValue ?? []
+            let celsius = entries.first { ["celcius", "celsius"].contains($0["unit"]?.stringValue?.lowercased() ?? "") }
+            return (celsius ?? entries.first)?["value"]?.doubleValue
+        }
+        guard let lo = pick("min"), let hi = pick("max"), lo <= hi else { return nil }
+        return ACRange(min: lo, max: hi, step: Swift.max(pick("increment") ?? 1, 0.5))
+    }
+
+    /// String `values` of the named capability's first attribute.
+    static func values(_ name: String, in model: JSONValue?) -> [String] {
+        attribute(name, in: model)?["values"]?.arrayValue.compactMap(\.stringValue) ?? []
+    }
+}
+
+extension ACDevice {
+    /// Modes the model allows (e.g. no Heat on cooling-only units); app defaults without a model.
+    var modeOptions: [String] {
+        let v = ACCapability.values("ACMode", in: model)
+        return v.isEmpty ? ACStore.modes : v
+    }
+
+    /// Fan speeds the model allows; app defaults without a model.
+    var fanOptions: [String] {
+        let v = ACCapability.values("ACFanSpeed", in: model)
+        return v.isEmpty ? ACStore.fanSpeeds : v
+    }
+
+    /// Target temperature range and step (°C); 16–30 in 0.5° steps without a model.
+    var tempRange: ACRange {
+        ACCapability.range("ACTemperature", in: model) ?? ACRange(min: 16, max: 30, step: 0.5)
+    }
+
+    /// Timer range in minutes, when the model lists ACTimer.
+    var timerRange: ACRange? {
+        guard capabilities.contains(where: { $0.name == "ACTimer" }) else { return nil }
+        return ACCapability.range("ACTimer", in: model) ?? ACRange(min: 10, max: 1440, step: 10)
+    }
+
+    func capability(_ name: String) -> ACCapability? { capabilities.first { $0.name == name } }
 }

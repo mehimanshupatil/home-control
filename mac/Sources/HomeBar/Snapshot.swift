@@ -92,6 +92,10 @@ enum Snapshot {
         BulbCard.debugExpandFirst = true
         render(ACCard(device: ac.devices[0]), name: "ac-more", dir: dir, ac: ac, lights: lights)
         render(ACCard(device: ac.devices[1]), name: "ac-more-off-unknown", dir: dir, ac: ac, lights: lights)
+        if let clean = ac.devices[0].capability("EvaporatorClean") {
+            ac.send(ac.devices[0], capability: clean, value: "on")
+            render(ACCard(device: ac.devices[0]), name: "ac-clean", dir: dir, ac: ac, lights: lights)
+        }
         render(ACDiagnosticsCard {}, name: "diagnostics", dir: dir, ac: ac, lights: lights)
         render(BulbCard(bulb: lights.bulbs[0]), name: "bulb-scene", dir: dir, ac: ac, lights: lights)
     }
@@ -111,7 +115,43 @@ enum Snapshot {
         let leaks = forbidden.filter { json.contains($0) }
         print("diagnostics redaction:", leaks.isEmpty ? "PASS" : "FAIL \(leaks)")
         print("diagnostics masked key present:", json.contains("\"0011…\""))
-        print("diagnostics has model + status:", json.contains("controlCapabilities") && json.contains("rmhmd"))
+        print("diagnostics has model + status:", json.contains("controlCapabilities") && json.contains("\"acdc\""))
+        print("diagnostics has local fields:", json.contains("lanKeyAvailable") && json.contains("lastLocalDiscovery"))
+        checkModelParsing(ac)
+    }
+
+    /// Model 130185 must drive the core controls (no Heat, 1° steps, Convertible from intValues).
+    private static func checkModelParsing(_ ac: ACStore) {
+        let d = ac.devices[0]
+        let conv = d.capability("Convertible").map { cap -> [Int] in
+            if case .intChoice(let o) = cap.kind { return o.map(\.value) }
+            return []
+        } ?? []
+        let display = d.capability("DisplayControl").map { cap -> [String] in
+            if case .choice(let v) = cap.kind { return v }
+            return []
+        } ?? []
+        let checks: [(String, Bool)] = [
+            ("modes", d.modeOptions == ["auto", "cool", "dry", "fan"]),
+            ("fan", d.fanOptions == ["auto", "quiet", "low", "medium", "high"]),
+            ("temp range", d.tempRange == ACRange(min: 16, max: 30, step: 1)),
+            ("timer range", d.timerRange == ACRange(min: 10, max: 1440, step: 10)),
+            ("convertible", conv == [40, 55, 70, 80, 90, 100, 110, 0]),
+            ("display", display == ["on", "off"]),
+            ("no model defaults", ac.devices[1].modeOptions.contains("heat") && ac.devices[1].tempRange.step == 0.5),
+        ]
+        for (name, ok) in checks { print("model parsing \(name):", ok ? "PASS" : "FAIL") }
+
+        // Timer payload: relative seconds, other slot kept as remaining seconds.
+        var sent: [Int] = []
+        if let cap = d.capability("ACTimer") {
+            ac.setTimer(d, .on, seconds: 3600)
+            sent = ac.devices[0].state.raw[cap.key]?.arrayValue.compactMap(\.intValue) ?? []
+        }
+        let now = Int(Date().timeIntervalSince1970)
+        let offOK = sent.count == 2 && abs(sent[0] - (now + 7200)) < 5
+        let onOK = sent.count == 2 && abs(sent[1] - (now + 3600)) < 5
+        print("timer optimistic status (UTC) keeps off + sets on:", offOK && onOK ? "PASS" : "FAIL \(sent)")
     }
 
     private static func renderKeysCard(dir: String) {

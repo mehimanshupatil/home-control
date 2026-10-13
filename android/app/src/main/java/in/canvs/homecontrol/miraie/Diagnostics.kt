@@ -17,7 +17,12 @@ object Diagnostics {
 
     fun mask(hex: String?): String? = hex?.let { if (it.length <= 4) "..." else it.take(4) + "..." } // ASCII: org.json would escape "…"
 
-    fun build(appVersion: String, devices: List<AcState>, generatedAtMillis: Long = System.currentTimeMillis()): String {
+    fun build(
+        appVersion: String,
+        devices: List<AcState>,
+        generatedAtMillis: Long = System.currentTimeMillis(),
+        experimentalLocal: Boolean = false,
+    ): String {
         val arr = JSONArray()
         devices.forEach { d ->
             val caps = JSONArray()
@@ -36,6 +41,9 @@ object Diagnostics {
                     .put("udpSupported", d.udpSupported ?: JSONObject.NULL)
                     .put("transport", d.transport.name)
                     .put("online", d.online)
+                    .put("firmware", d.rawStatus["V"]?.toString() ?: JSONObject.NULL)
+                    .put("lanKeyAvailable", d.localKeys != null)
+                    .put("lastLocalDiscovery", d.lastLocalDiscovery)
                     .put(
                         "lan",
                         d.localKeys?.let {
@@ -52,6 +60,7 @@ object Diagnostics {
         return JSONObject()
             .put("app", "Home Control $appVersion")
             .put("generatedAt", generatedAtMillis)
+            .put("experimentalLocal", experimentalLocal)
             .put("note", "No password, tokens or full LAN keys are included.")
             .put("acs", arr)
             .toString(2)
