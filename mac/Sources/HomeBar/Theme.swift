@@ -10,6 +10,7 @@ enum Metrics {
 
 /// Elevated card surface: fill plus layered soft shadows instead of a depth border.
 struct CardSurface: ViewModifier {
+    @Environment(\.colorScheme) private var colorScheme
     var tint: Color? = nil
 
     func body(content: Content) -> some View {
@@ -18,6 +19,12 @@ struct CardSurface: ViewModifier {
             .background {
                 RoundedRectangle(cornerRadius: Metrics.cardRadius, style: .continuous)
                     .fill(.background.secondary)
+                    // Dark mode: lift the card off the window so elevation reads without a border.
+                    .overlay {
+                        if colorScheme == .dark {
+                            RoundedRectangle(cornerRadius: Metrics.cardRadius, style: .continuous).fill(Color.white.opacity(0.04))
+                        }
+                    }
                     .overlay {
                         if let tint {
                             RoundedRectangle(cornerRadius: Metrics.cardRadius, style: .continuous)
@@ -160,6 +167,49 @@ struct StatusPill: View {
         .padding(.vertical, 2)
         .foregroundStyle(textColor)
         .background(Capsule().fill(color.opacity(0.15)))
+    }
+}
+
+/// Card-level status chip (active timer, running sleep profile, alerts). Larger than `StatusPill`, with an
+/// optional close button inside the capsule. Text never wraps.
+struct StatusChip: View {
+    @Environment(\.colorScheme) private var colorScheme
+    let text: String
+    let color: Color
+    let symbol: String
+    var help: String?
+    var closeLabel: String?
+    var onClose: (() -> Void)?
+
+    private var textColor: Color {
+        guard colorScheme == .light, let dark = NSColor(color).blended(withFraction: 0.4, of: .black) else { return color }
+        return Color(nsColor: dark)
+    }
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Image(systemName: symbol).font(.system(size: 10, weight: .semibold))
+            Text(text).lineLimit(1).monospacedDigit()
+            if let onClose {
+                Button(action: onClose) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 8, weight: .bold))
+                        .frame(width: 16, height: 16)
+                        .background(Circle().fill(color.opacity(0.18)))
+                }
+                .buttonStyle(.pressable)
+                .help(closeLabel ?? "Cancel")
+                .accessibilityLabel(closeLabel ?? "Cancel")
+            }
+        }
+        .font(.caption.weight(.semibold))
+        .foregroundStyle(textColor)
+        .padding(.leading, 8)
+        .padding(.trailing, onClose == nil ? 8 : 4)
+        .frame(height: 24)
+        .background(Capsule().fill(color.opacity(0.14)))
+        .help(help ?? text)
+        .fixedSize()
     }
 }
 

@@ -2,12 +2,13 @@ import SwiftUI
 
 struct LightsSection: View {
     @EnvironmentObject private var lights: LightsStore
+    @EnvironmentObject private var nav: Navigator
 
     var body: some View {
         VStack(alignment: .leading, spacing: Metrics.sectionSpacing) {
             SectionHeader(
                 title: "Lights",
-                detail: lights.bulbs.isEmpty ? nil : "\(lights.bulbs.count) found",
+                detail: lights.bulbs.isEmpty ? nil : "\(lights.bulbs.filter(\.on).count) of \(lights.bulbs.count) on",
                 busy: lights.scanning,
                 refreshHelp: "Scan for WiZ bulbs"
             ) { Task { await lights.discover() } }
@@ -38,16 +39,17 @@ struct LightsSection: View {
 
             let others = lights.ungrouped
             if !others.isEmpty {
-                if !lights.groups.isEmpty {
-                    Text("Other lights").font(.caption.weight(.semibold)).foregroundStyle(.secondary).padding(.top, 2)
-                }
-                ForEach(others) { bulb in
-                    BulbCard(bulb: bulb)
+                VStack(alignment: .leading, spacing: 8) {
+                    if !lights.groups.isEmpty {
+                        Text("Other lights").font(.subheadline.weight(.semibold))
+                    }
+                    BulbGrid(bulbs: others)
                 }
             }
 
             if !lights.bulbs.isEmpty {
-                NewRoomButton()
+                NavRow(title: "Manage rooms", symbol: "square.split.bottomrightquarter") { nav.push(.rooms) }
+                    .padding(.horizontal, 4)
             }
         }
     }
@@ -65,6 +67,7 @@ struct LightPresetsRow: View {
                     Button { lights.applyPreset(p) } label: {
                         Text(p.name)
                             .font(.caption.weight(.medium))
+                            .lineLimit(1)
                             .padding(.horizontal, 10)
                             .frame(height: 24)
                             .background(Capsule().fill(Color.primary.opacity(0.08)))
@@ -81,7 +84,7 @@ struct LightPresetsRow: View {
     }
 }
 
-/// A room header with group power, brightness and scene, followed by its bulbs.
+/// A room: header with on-count, scene menu, options and group power; group brightness; tile grid.
 struct LightRoomSection: View {
     @EnvironmentObject private var lights: LightsStore
     let group: LightGroup
@@ -100,11 +103,12 @@ struct LightRoomSection: View {
                         .textFieldStyle(.roundedBorder)
                         .onSubmit(commit)
                         .onExitCommand { renaming = false; savingPreset = false }
-                    Button("Save", action: commit).font(.caption.weight(.semibold))
+                    Button("Save", action: commit).controlSize(.small)
                 } else {
                     VStack(alignment: .leading, spacing: 1) {
                         Text(group.name).font(.subheadline.weight(.semibold))
-                        Text("\(members.filter(\.on).count) of \(members.count) on").font(.caption2).foregroundStyle(.secondary).monospacedDigit()
+                        Text("\(members.filter(\.on).count) of \(members.count) on")
+                            .font(.caption).foregroundStyle(.secondary).monospacedDigit()
                     }
                     Spacer()
                     Menu {
@@ -120,11 +124,13 @@ struct LightRoomSection: View {
                     .fixedSize()
                     .disabled(members.isEmpty)
                     Menu {
-                        Button("Save as preset…") { draft = group.name; savingPreset = true }.disabled(members.isEmpty)
-                        Button("Rename room…") { draft = group.name; renaming = true }
+                        Button("Save as Preset…") { draft = group.name; savingPreset = true }.disabled(members.isEmpty)
+                        Button("Rename Room…") { draft = group.name; renaming = true }
                         Divider()
-                        Button("Delete room", role: .destructive) { lights.deleteGroup(group) }
-                    } label: { Image(systemName: "ellipsis.circle") }
+                        Button("Delete Room", role: .destructive) { lights.deleteGroup(group) }
+                    } label: {
+                        Image(systemName: "ellipsis").font(.system(size: 12, weight: .medium))
+                    }
                     .menuStyle(.borderlessButton)
                     .menuIndicator(.hidden)
                     .fixedSize()
@@ -139,17 +145,16 @@ struct LightRoomSection: View {
                     Slider(value: $dimming, in: 10...100) { editing in
                         if !editing { lights.setGroupDimming(group, Int(dimming)) }
                     }
+                    .tint(.orange)
                     .accessibilityLabel("\(group.name) brightness")
                     Text("\(Int(dimming))%").monospacedDigit().frame(width: 36, alignment: .trailing)
                 }
                 .font(.caption)
                 .foregroundStyle(.secondary)
+                BulbGrid(bulbs: members)
             } else {
-                Text("No lights yet — open a bulb's options and choose this room.")
+                Text("No lights yet. Open a light and choose this room.")
                     .font(.caption).foregroundStyle(.secondary)
-            }
-            ForEach(members) { bulb in
-                BulbCard(bulb: bulb)
             }
         }
         .onAppear {
@@ -166,6 +171,16 @@ struct LightRoomSection: View {
     }
 }
 
+struct BulbGrid: View {
+    let bulbs: [Bulb]
+
+    var body: some View {
+        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 2), spacing: 8) {
+            ForEach(bulbs) { BulbTile(bulb: $0) }
+        }
+    }
+}
+
 struct NewRoomButton: View {
     @EnvironmentObject private var lights: LightsStore
     @ViewState private var editing = false
@@ -179,11 +194,11 @@ struct NewRoomButton: View {
                     .onSubmit(save)
                     .onExitCommand { editing = false }
                 Button("Cancel") { editing = false }.buttonStyle(.borderless).font(.caption)
-                Button("Add", action: save).font(.caption.weight(.semibold)).disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
+                Button("Add", action: save).controlSize(.small).disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
             }
         } else {
             Button { name = ""; editing = true } label: {
-                Label("New room", systemImage: "plus").font(.caption.weight(.medium))
+                Label("New room", systemImage: "plus").font(.callout)
             }
             .buttonStyle(.borderless)
         }
@@ -216,17 +231,110 @@ struct QuickAction: View {
     }
 }
 
-struct BulbCard: View {
+// MARK: Bulb tile
+
+/// Grid tile: the glowing icon toggles power; the name row opens the bulb page.
+struct BulbTile: View {
     @EnvironmentObject private var lights: LightsStore
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @EnvironmentObject private var nav: Navigator
+    @Environment(\.colorScheme) private var colorScheme
     let bulb: Bulb
 
-    #if DEBUG
-    nonisolated(unsafe) static var debugExpandFirst = false
-    @ViewState private var expanded = BulbCard.debugExpandFirst
-    #else
-    @ViewState private var expanded = false
-    #endif
+    static let padding: CGFloat = 10
+    static let radius: CGFloat = Metrics.tileRadius + padding // 16, concentric with the 6 pt tile radius
+
+    var body: some View {
+        let light = bulb.lightColor
+        VStack(alignment: .leading, spacing: 8) {
+            Button { lights.setOn(bulb, !bulb.on) } label: {
+                Image(systemName: bulb.on ? "lightbulb.fill" : "lightbulb")
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(bulb.on ? Color.black.opacity(0.75) : Color.secondary)
+                    .frame(width: 34, height: 34)
+                    .background(Circle().fill(bulb.on ? AnyShapeStyle(light) : AnyShapeStyle(Color.primary.opacity(0.08))))
+                    .shadow(color: bulb.on ? light.opacity(0.5) : .clear, radius: 6)
+            }
+            .buttonStyle(.pressable)
+            .disabled(!bulb.reachable)
+            .help(bulb.on ? "Turn off" : "Turn on")
+            .accessibilityLabel("\(bulb.name) power")
+            .accessibilityValue(bulb.on ? "On" : "Off")
+
+            Button { nav.push(.bulb(bulb.id)) } label: {
+                HStack(spacing: 4) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(bulb.name).font(.callout.weight(.semibold)).lineLimit(1)
+                        Text(bulb.statusText)
+                            .font(.caption)
+                            .foregroundStyle(bulb.reachable ? Color.secondary : Color.red)
+                            .monospacedDigit()
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 0)
+                    Image(systemName: "chevron.right").font(.system(size: 10, weight: .semibold)).foregroundStyle(.tertiary)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.pressable)
+            .help("Open \(bulb.name)")
+            .accessibilityLabel("\(bulb.name), \(bulb.statusText). Open light settings")
+        }
+        .padding(Self.padding)
+        .background {
+            RoundedRectangle(cornerRadius: Self.radius, style: .continuous)
+                .fill(.background.secondary)
+                .overlay {
+                    if colorScheme == .dark {
+                        RoundedRectangle(cornerRadius: Self.radius, style: .continuous).fill(Color.white.opacity(0.04))
+                    }
+                }
+                .overlay {
+                    if bulb.on {
+                        RoundedRectangle(cornerRadius: Self.radius, style: .continuous).fill(light.opacity(0.14))
+                    }
+                }
+                .shadow(color: .black.opacity(0.06), radius: 0.5, y: 0.5)
+                .shadow(color: .black.opacity(0.08), radius: 6, y: 2)
+        }
+        .opacity(bulb.reachable ? 1 : 0.6)
+        .animation(.easeOut(duration: 0.15), value: bulb.on)
+    }
+}
+
+@MainActor
+extension Bulb {
+    var lightColor: Color {
+        if let rgb {
+            return Color(red: Double(rgb.r) / 255, green: Double(rgb.g) / 255, blue: Double(rgb.b) / 255)
+        }
+        // Approximate white temperature: warm amber → neutral → cool blue-white.
+        let k = Double(temp ?? 3500)
+        let t = min(1, max(0, (k - 2200) / (6500 - 2200)))
+        return Color(red: 1, green: 0.78 + 0.2 * t, blue: 0.45 + 0.55 * t)
+    }
+
+    var statusText: String {
+        guard reachable else { return "Unreachable" }
+        guard on else { return "Off" }
+        var detail = "\(dimming)%"
+        if sceneId > 0, let scene = LightsStore.sceneName(sceneId) {
+            detail += " · \(scene)"
+        } else if rgb != nil {
+            detail += " · Color"
+        } else if let t = temp {
+            detail += " · \(t)K"
+        }
+        return detail
+    }
+}
+
+// MARK: Bulb page
+
+/// Everything for one bulb: power + brightness, white, colour, scene + speed, organize.
+struct BulbPage: View {
+    @EnvironmentObject private var lights: LightsStore
+    let bulb: Bulb
+
     @ViewState private var editingName = false
     @ViewState private var nameDraft = ""
     @ViewState private var dimming: Double = 100
@@ -241,101 +349,44 @@ struct BulbCard: View {
     ]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            header
-
-            if bulb.on {
-                brightnessRow
-                    .transition(.reveal(reduceMotion: reduceMotion))
-            }
-
-            if expanded {
-                details
-                    .transition(.reveal(reduceMotion: reduceMotion))
-            }
-        }
-        .card(tint: bulb.on ? lightColor : nil)
-        .opacity(bulb.reachable ? 1 : 0.6)
-        .animation(.easeOut(duration: 0.15), value: bulb.on)
-        .onAppear(perform: syncFromBulb)
-        .onChange(of: bulb) { _, _ in syncFromBulb() }
-    }
-
-    // MARK: Header
-
-    private var header: some View {
-        HStack(spacing: 10) {
-            Button { lights.setOn(bulb, !bulb.on) } label: {
-                Image(systemName: bulb.on ? "lightbulb.fill" : "lightbulb")
-                    .font(.system(size: 16, weight: .medium))
-                    .foregroundStyle(bulb.on ? Color.black.opacity(0.75) : Color.secondary)
-                    .frame(width: 36, height: 36)
-                    .background(
-                        Circle().fill(bulb.on ? AnyShapeStyle(lightColor) : AnyShapeStyle(Color.primary.opacity(0.08)))
-                    )
-                    .shadow(color: bulb.on ? lightColor.opacity(0.5) : .clear, radius: 6)
-            }
-            .buttonStyle(.pressable)
-            .disabled(!bulb.reachable)
-            .help(bulb.on ? "Turn off" : "Turn on")
-            .accessibilityLabel("\(bulb.name) power")
-            .accessibilityValue(bulb.on ? "On" : "Off")
-
-            if editingName {
-                TextField("Name", text: $nameDraft)
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit(commitRename)
-                    .onExitCommand { editingName = false }
-            } else {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(bulb.name).font(.headline).lineLimit(1)
-                    Text(statusText)
-                        .font(.caption)
-                        .foregroundStyle(bulb.reachable ? Color.secondary : Color.red)
-                        .monospacedDigit()
-                        .lineLimit(1)
+        let light = bulb.lightColor
+        VStack(spacing: Metrics.sectionSpacing) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 12) {
+                    Button { lights.setOn(bulb, !bulb.on) } label: {
+                        Image(systemName: bulb.on ? "lightbulb.fill" : "lightbulb")
+                            .font(.system(size: 20, weight: .medium))
+                            .foregroundStyle(bulb.on ? Color.black.opacity(0.75) : Color.secondary)
+                            .frame(width: 48, height: 48)
+                            .background(Circle().fill(bulb.on ? AnyShapeStyle(light) : AnyShapeStyle(Color.primary.opacity(0.08))))
+                            .shadow(color: bulb.on ? light.opacity(0.5) : .clear, radius: 8)
+                    }
+                    .buttonStyle(.pressable)
+                    .disabled(!bulb.reachable)
+                    .help(bulb.on ? "Turn off" : "Turn on")
+                    .accessibilityLabel("\(bulb.name) power")
+                    .accessibilityValue(bulb.on ? "On" : "Off")
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(bulb.on ? "On" : "Off").font(.headline)
+                        Text(bulb.statusText).font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                    }
+                    Spacer()
                 }
-                .contentShape(Rectangle())
-                .onTapGesture(count: 2, perform: startRename)
+                HStack(spacing: 8) {
+                    Image(systemName: "sun.min").accessibilityHidden(true)
+                    Slider(value: $dimming, in: 10...100) { editing in
+                        if !editing { lights.setDimming(bulb, Int(dimming)) }
+                    }
+                    .tint(light)
+                    .accessibilityLabel("Brightness")
+                    Text("\(Int(dimming))%").monospacedDigit().frame(width: 36, alignment: .trailing)
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
+            .card(tint: bulb.on ? light : nil)
 
-            Spacer(minLength: 4)
-
-            Button { expanded.toggle() } label: {
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 11, weight: .semibold))
-                    .rotationEffect(.degrees(expanded ? 180 : 0))
-                    .frame(width: 24, height: 24)
-                    .background(Circle().fill(Color.primary.opacity(expanded ? 0.1 : 0.05)))
-            }
-            .buttonStyle(.pressable)
-            .help(expanded ? "Fewer options" : "More options")
-            .accessibilityLabel(expanded ? "Hide options" : "Show options")
-        }
-    }
-
-    private var brightnessRow: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "sun.min").accessibilityHidden(true)
-            Slider(value: $dimming, in: 10...100) { editing in
-                if !editing { lights.setDimming(bulb, Int(dimming)) }
-            }
-            .tint(lightColor)
-            .accessibilityLabel("Brightness")
-            Text("\(Int(dimming))%")
-                .monospacedDigit()
-                .frame(width: 36, alignment: .trailing)
-        }
-        .font(.caption)
-        .foregroundStyle(.secondary)
-    }
-
-    // MARK: Details
-
-    private var details: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            VStack(alignment: .leading, spacing: 6) {
-                Text("White").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+            PageSection("White") {
                 Capsule()
                     .fill(LinearGradient(colors: [Color(red: 1, green: 0.72, blue: 0.42), .white, Color(red: 0.78, green: 0.88, blue: 1)],
                                          startPoint: .leading, endPoint: .trailing))
@@ -350,13 +401,12 @@ struct BulbCard: View {
                     .accessibilityLabel("Color temperature")
                     Text("Cool")
                 }
-                .font(.caption2)
+                .font(.caption)
                 .foregroundStyle(.secondary)
             }
 
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Color").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                HStack(spacing: 8) {
+            PageSection("Color") {
+                HStack(spacing: 6) {
                     ForEach(Array(Self.swatches.enumerated()), id: \.offset) { _, rgb in
                         swatch(rgb)
                     }
@@ -364,12 +414,11 @@ struct BulbCard: View {
                     ColorPicker("Custom color", selection: $color, supportsOpacity: false)
                         .labelsHidden()
                         .onChange(of: color) { _, newColor in sendColor(newColor) }
+                        .help("Custom color")
                 }
             }
 
-            HStack {
-                Text("Scene").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                Spacer()
+            PageSection("Scene") {
                 Picker("Scene", selection: Binding(get: { bulb.sceneId }, set: { if $0 > 0 { lights.setScene(bulb, $0) } })) {
                     Text("None").tag(0)
                     ForEach(LightsStore.sceneGroups, id: \.title) { group in
@@ -382,65 +431,75 @@ struct BulbCard: View {
                 }
                 .labelsHidden()
                 .pickerStyle(.menu)
-                .fixedSize()
-            }
-
-            if LightsStore.movingScenes.contains(bulb.sceneId) {
-                HStack(spacing: 8) {
-                    Text("Speed").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                    Image(systemName: "tortoise").accessibilityHidden(true)
-                    Slider(value: $speed, in: 10...200) { editing in
-                        if !editing { lights.setSpeed(bulb, Int(speed)) }
+                if LightsStore.movingScenes.contains(bulb.sceneId) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "tortoise").accessibilityHidden(true)
+                        Slider(value: $speed, in: 10...200) { editing in
+                            if !editing { lights.setSpeed(bulb, Int(speed)) }
+                        }
+                        .accessibilityLabel("Scene speed")
+                        Image(systemName: "hare").accessibilityHidden(true)
                     }
-                    .accessibilityLabel("Scene speed")
-                    Image(systemName: "hare").accessibilityHidden(true)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 }
-                .font(.caption)
-                .foregroundStyle(.secondary)
             }
 
-            if !lights.groups.isEmpty {
-                HStack {
-                    Text("Room").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                    Spacer()
-                    Picker("Room", selection: Binding(get: { lights.group(of: bulb)?.id }, set: { id in
-                        lights.assign(bulb, to: lights.groups.first { $0.id == id })
-                    })) {
-                        Text("None").tag(UUID?.none)
-                        ForEach(lights.groups) { Text($0.name).tag(UUID?.some($0.id)) }
+            PageSection("Organize") {
+                VStack(spacing: 8) {
+                    HStack {
+                        Text("Name").font(.callout)
+                        Spacer()
+                        if editingName {
+                            TextField("Name", text: $nameDraft)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(width: 160)
+                                .onSubmit(commitRename)
+                                .onExitCommand { editingName = false }
+                            Button("Save", action: commitRename).controlSize(.small)
+                        } else {
+                            Text(bulb.name).font(.callout).foregroundStyle(.secondary).lineLimit(1)
+                            Button("Rename", action: startRename).controlSize(.small)
+                        }
                     }
-                    .labelsHidden()
-                    .pickerStyle(.menu)
-                    .fixedSize()
+                    HStack {
+                        Text("Room").font(.callout)
+                        Spacer()
+                        Picker("Room", selection: Binding(get: { lights.group(of: bulb)?.id }, set: { id in
+                            lights.assign(bulb, to: lights.groups.first { $0.id == id })
+                        })) {
+                            Text("None").tag(UUID?.none)
+                            ForEach(lights.groups) { Text($0.name).tag(UUID?.some($0.id)) }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
+                        .fixedSize()
+                        .disabled(lights.groups.isEmpty)
+                        .help(lights.groups.isEmpty ? "Create a room first (Settings › Manage Rooms)" : "Move to a room")
+                    }
+                    if savingPreset {
+                        HStack(spacing: 6) {
+                            TextField("Preset name", text: $presetName)
+                                .textFieldStyle(.roundedBorder)
+                                .onSubmit(savePreset)
+                                .onExitCommand { savingPreset = false }
+                            Button("Save", action: savePreset).controlSize(.small)
+                        }
+                    }
+                    HStack(spacing: 8) {
+                        Button { lights.identify(bulb) } label: { Label("Identify", systemImage: "wave.3.right") }
+                            .help("Blink this bulb so you can spot it")
+                        Button { presetName = bulb.name; savingPreset = true } label: { Label("Save Preset", systemImage: "sparkles") }
+                            .help("Save this light's current colour, brightness and scene")
+                        Spacer()
+                        Text(bulb.ip).font(.caption).foregroundStyle(.tertiary).monospacedDigit().textSelection(.enabled)
+                    }
+                    .controlSize(.small)
                 }
-            }
-
-            if savingPreset {
-                HStack(spacing: 6) {
-                    TextField("Preset name", text: $presetName)
-                        .textFieldStyle(.roundedBorder)
-                        .onSubmit(savePreset)
-                        .onExitCommand { savingPreset = false }
-                    Button("Save", action: savePreset).font(.caption.weight(.semibold))
-                }
-            }
-
-            HStack(spacing: 12) {
-                Text(bulb.ip).font(.caption2).foregroundStyle(.tertiary).monospacedDigit()
-                Spacer()
-                Button("Save preset") { presetName = bulb.name; savingPreset = true }
-                    .buttonStyle(.borderless)
-                    .font(.caption)
-                    .help("Save this light's current colour, brightness and scene")
-                Button("Identify") { lights.identify(bulb) }
-                    .buttonStyle(.borderless)
-                    .font(.caption)
-                    .help("Pulse this bulb so you can spot it")
-                Button("Rename", action: startRename)
-                    .buttonStyle(.borderless)
-                    .font(.caption)
             }
         }
+        .onAppear(perform: syncFromBulb)
+        .onChange(of: bulb) { _, _ in syncFromBulb() }
     }
 
     private func swatch(_ rgb: (Int, Int, Int)) -> some View {
@@ -457,32 +516,6 @@ struct BulbCard: View {
         .buttonStyle(.pressable)
         .accessibilityLabel("Color \(rgb.0), \(rgb.1), \(rgb.2)")
         .accessibilityAddTraits(selected ? .isSelected : [])
-    }
-
-    // MARK: Helpers
-
-    private var lightColor: Color {
-        if let rgb = bulb.rgb {
-            return Color(red: Double(rgb.r) / 255, green: Double(rgb.g) / 255, blue: Double(rgb.b) / 255)
-        }
-        // Approximate white temperature: warm amber → neutral → cool blue-white.
-        let k = Double(bulb.temp ?? 3500)
-        let t = min(1, max(0, (k - 2200) / (6500 - 2200)))
-        return Color(red: 1, green: 0.78 + 0.2 * t, blue: 0.45 + 0.55 * t)
-    }
-
-    private var statusText: String {
-        guard bulb.reachable else { return "Unreachable" }
-        guard bulb.on else { return "Off" }
-        var detail = "\(bulb.dimming)%"
-        if bulb.sceneId > 0, let scene = LightsStore.sceneName(bulb.sceneId) {
-            detail += " · \(scene)"
-        } else if bulb.rgb != nil {
-            detail += " · Color"
-        } else if let t = bulb.temp {
-            detail += " · \(t)K"
-        }
-        return detail
     }
 
     private func savePreset() {

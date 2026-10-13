@@ -5,6 +5,7 @@ import SwiftUI
 struct HomeBarApp: App {
     @StateObject private var ac = ACStore()
     @StateObject private var lights = LightsStore()
+    @StateObject private var nav = Navigator()
 
     init() {
         #if DEBUG
@@ -17,6 +18,7 @@ struct HomeBarApp: App {
             ContentView()
                 .environmentObject(ac)
                 .environmentObject(lights)
+                .environmentObject(nav)
         } label: {
             Image(systemName: ac.anyOn ? "air.conditioner.horizontal.fill"
                   : lights.anyOn ? "lightbulb.fill" : "house")
@@ -33,22 +35,47 @@ enum HomeTab: Int, CaseIterable {
 }
 
 struct ContentView: View {
+    @EnvironmentObject private var nav: Navigator
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @AppStorage("selectedTab") private var tabRaw = 0
+
+    /// Height of the scrolling list area (docs/UI.md: 540 pt).
+    static let listHeight: CGFloat = 540
+    #if DEBUG
+    /// Snapshot harness: let the list grow to its full height.
+    nonisolated(unsafe) static var debugUnbounded = false
+    #endif
 
     private var tab: HomeTab { HomeTab(rawValue: tabRaw) ?? .climate }
 
     var body: some View {
+        ZStack(alignment: .top) {
+            // The tab list stays alive under a pushed page so Back restores its scroll position.
+            home
+                .opacity(nav.route == nil ? 1 : 0)
+                .allowsHitTesting(nav.route == nil)
+                .accessibilityHidden(nav.route != nil)
+            if let route = nav.route {
+                PageView(route: route)
+                    .id(route)
+                    .transition(.page(reduceMotion: reduceMotion))
+            }
+        }
+        .frame(width: 380)
+    }
+
+    private var home: some View {
         VStack(spacing: 0) {
             HeaderView()
                 .padding(.horizontal, 16)
                 .padding(.top, 14)
-                .padding(.bottom, 10)
+                .padding(.bottom, 12)
 
             TabSwitcher(selection: $tabRaw)
                 .padding(.horizontal, 16)
                 .padding(.bottom, 12)
 
-            ScrollView {
+            PanelScroll {
                 Group {
                     switch tab {
                     case .climate: ACSection()
@@ -58,10 +85,32 @@ struct ContentView: View {
                 .padding(.horizontal, 16)
                 .padding(.bottom, 16)
             }
-            .scrollIndicators(.never)
-            .frame(height: 470)
+            .frame(height: listHeight)
         }
-        .frame(width: 380)
+    }
+
+    private var listHeight: CGFloat? {
+        #if DEBUG
+        if Self.debugUnbounded { return nil }
+        #endif
+        return Self.listHeight
+    }
+}
+
+/// Vertical scroll area; the DEBUG snapshot harness lays content out at full height instead.
+struct PanelScroll<Content: View>: View {
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        #if DEBUG
+        if ContentView.debugUnbounded {
+            content()
+        } else {
+            ScrollView { content() }.scrollIndicators(.never)
+        }
+        #else
+        ScrollView { content() }.scrollIndicators(.never)
+        #endif
     }
 }
 
@@ -108,35 +157,33 @@ struct HeaderView: View {
 
 struct SettingsMenu: View {
     @EnvironmentObject private var ac: ACStore
-    @AppStorage("showACKeys") private var showACKeys = false
-    @AppStorage("showACDiagnostics") private var showDiagnostics = false
-    @AppStorage("showACNotifications") private var showNotifications = false
+    @EnvironmentObject private var nav: Navigator
+    @AppStorage("selectedTab") private var tabRaw = 0
     @ViewState private var launchAtLogin = SMAppService.mainApp.status == .enabled
 
     var body: some View {
         Menu {
             Toggle("Launch at Login", isOn: Binding(get: { launchAtLogin }, set: setLaunchAtLogin))
             if ac.loggedIn {
-                Toggle("AC: Local Network Only", isOn: $ac.localOnly)
-                Toggle("Try Local Control (Experimental)", isOn: $ac.tryLocal)
-                Toggle("Show AC Keys", isOn: $showACKeys)
-                Button("Copy AC Key Code") {
-                    if let code = ac.exportKeyCode() {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(code, forType: .string)
+                Section("Air conditioners") {
+                    Toggle("Local Network Only", isOn: $ac.localOnly)
+                    Toggle("Try Local Control (Experimental)", isOn: $ac.tryLocal)
+                    Button(ac.unreadAlerts > 0 ? "Notifications (\(ac.unreadAlerts) new)…" : "Notifications…") { open(.notifications) }
+                    Button("Diagnostics…") { open(.diagnostics) }
+                    Button("LAN Keys…") { open(.keys) }
+                        .disabled(ac.exportableDevices.isEmpty)
+                    Button("Copy AC Key Code") {
+                        if let code = ac.exportKeyCode() {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(code, forType: .string)
+                        }
                     }
+                    .disabled(ac.exportableDevices.isEmpty)
+                    Button("Sign Out of MirAIe") { ac.logout(); nav.pop() }
                 }
-                .disabled(ac.exportableDevices.isEmpty)
-                Button(ac.unreadAlerts > 0 ? "AC Notifications (\(ac.unreadAlerts) new)…" : "AC Notifications…") {
-                    showNotifications = true
-                    UserDefaults.standard.set(HomeTab.climate.rawValue, forKey: "selectedTab")
-                }
-                Button("AC Diagnostics…") {
-                    showDiagnostics = true
-                    UserDefaults.standard.set(HomeTab.climate.rawValue, forKey: "selectedTab")
-                }
-                Divider()
-                Button("Sign Out of MirAIe") { ac.logout() }
+            }
+            Section("Lights") {
+                Button("Manage Rooms…") { tabRaw = HomeTab.lights.rawValue; nav.push(.rooms) }
             }
             Divider()
             Button("Quit Home") { NSApp.terminate(nil) }
@@ -154,6 +201,11 @@ struct SettingsMenu: View {
         .accessibilityLabel("Settings")
     }
 
+    private func open(_ r: Route) {
+        tabRaw = HomeTab.climate.rawValue
+        nav.push(r)
+    }
+
     private func setLaunchAtLogin(_ enabled: Bool) {
         do {
             if enabled { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
@@ -164,6 +216,7 @@ struct SettingsMenu: View {
 
 /// Segmented control drawn as a pill track. Tab switches are frequent, so selection changes instantly.
 struct TabSwitcher: View {
+    @Environment(\.colorScheme) private var colorScheme
     @Binding var selection: Int
 
     var body: some View {
@@ -177,7 +230,7 @@ struct TabSwitcher: View {
                         .foregroundStyle(selected ? Color.primary : Color.secondary)
                         .background(
                             RoundedRectangle(cornerRadius: 7, style: .continuous)
-                                .fill(selected ? Color(nsColor: .controlBackgroundColor) : .clear)
+                                .fill(selected ? (colorScheme == .dark ? Color.white.opacity(0.14) : Color(nsColor: .controlBackgroundColor)) : .clear)
                                 .shadow(color: .black.opacity(selected ? 0.1 : 0), radius: 1.5, y: 0.5)
                         )
                 }

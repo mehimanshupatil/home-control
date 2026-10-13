@@ -252,7 +252,7 @@ class AcRepository(context: Context, private val store: SecureStore) {
         fun dev(id: String, name: String, space: String, model: String?) =
             MiraieDevice(id, name, model, "AC", "h/$id", "h", space, spaceId = if (id == "d1") "s1" else "s2")
         val now = System.currentTimeMillis() / 1000
-        val status = JSONObject(DEMO_STATUS).put("actm", JSONArray(listOf(now + 95 * 60, -1))).toMap()
+        val status = JSONObject(DEMO_STATUS).put("actm", JSONArray(listOf(now + 95 * 60, -1))).put("acsp", "p1").toMap()
         val bedroom = AcState(
             dev("d1", "Bedroom AC", "Bedroom", "130185"), transport = Transport.Cloud, udpSupported = false,
             power = true, mode = "cool", temperature = 26.0, roomTemperature = 32.0, fanSpeed = "auto",

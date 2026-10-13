@@ -56,39 +56,56 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import `in`.canvs.homecontrol.miraie.AcRepository
 import `in`.canvs.homecontrol.wiz.LightsRepository
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.runtime.LaunchedEffect
+
+/** Routes on the back stack: an [AcPage] encoding, or "bulb:<mac>". Empty stack = home (tabs). */
+private fun isBulbRoute(r: String) = r.startsWith("bulb:")
 
 @Composable
 fun HomeControlRoot(ac: AcRepository, lights: LightsRepository) {
     HomeControlTheme {
         var tab by rememberSaveable { mutableIntStateOf(0) }
-        var showKeys by rememberSaveable { mutableStateOf(false) }
-        var showDiagnostics by rememberSaveable { mutableStateOf(false) }
-        var pageKey by rememberSaveable { mutableStateOf<String?>(null) }
-        val page = AcPage.decode(pageKey)
-        BackHandler(enabled = page != null) { pageKey = null }
+        var stack by rememberSaveable { mutableStateOf(listOf<String>()) }
+        var forward by remember { mutableStateOf(true) }
+        var addRoomRequest by remember { mutableIntStateOf(0) }
+        val climateList = rememberLazyListState()
+        val lightsList = rememberLazyListState()
+        val density = LocalDensity.current.density
+
+        fun push(route: String) { forward = true; stack = stack + route }
+        fun pop() { if (stack.isNotEmpty()) { forward = false; stack = stack.dropLast(1) } }
+        BackHandler(enabled = stack.isNotEmpty()) { pop() }
+
         Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.surface) {
-            if (page != null) {
-                Box(Modifier.fillMaxSize().safeDrawingPadding()) { AcPageHost(page, ac) { pageKey = null } }
-                return@Surface
-            }
-            Column(Modifier.fillMaxSize().safeDrawingPadding()) {
-                Header(
-                    ac, lights,
-                    showKeys = showKeys, onToggleKeys = { showKeys = !showKeys; tab = 0 },
-                    showDiagnostics = showDiagnostics, onToggleDiagnostics = { showDiagnostics = !showDiagnostics; tab = 0 },
-                    onOpenNotifications = { pageKey = AcPage.Notifications.encode() },
-                )
-                TabSwitcher(tab) { tab = it }
-                Spacer(Modifier.height(Metrics.sectionSpacing))
-                Box(Modifier.weight(1f)) {
-                    when (tab) {
-                        0 -> AcScreen(
-                            ac,
-                            showKeys = showKeys, onHideKeys = { showKeys = false },
-                            showDiagnostics = showDiagnostics, onHideDiagnostics = { showDiagnostics = false },
-                            onOpen = { pageKey = it.encode() },
-                        )
-                        else -> LightsScreen(lights)
+            AnimatedContent(
+                targetState = stack.lastOrNull(),
+                transitionSpec = { pageTransition(forward, density) },
+                label = "page",
+            ) { route ->
+                Box(Modifier.fillMaxSize().safeDrawingPadding()) {
+                    when {
+                        route == null -> Column(Modifier.fillMaxSize()) {
+                            Header(
+                                ac, lights,
+                                onOpenAcPage = { push(it.encode()) },
+                                onAddRoom = { tab = 1; addRoomRequest++ },
+                            )
+                            TabSwitcher(tab) { tab = it }
+                            Spacer(Modifier.height(Metrics.sectionSpacing))
+                            Box(Modifier.weight(1f)) {
+                                when (tab) {
+                                    0 -> AcScreen(ac, climateList, onOpen = { push(it.encode()) })
+                                    else -> LightsScreen(lights, lightsList, addRoomRequest, onOpenBulb = { push("bulb:$it") })
+                                }
+                            }
+                        }
+                        isBulbRoute(route) -> BulbPage(lights, route.removePrefix("bulb:"), onBack = ::pop)
+                        else -> AcPage.decode(route)?.let { page ->
+                            AcPageHost(page, ac, onBack = ::pop, onOpen = { push(it.encode()) })
+                        } ?: LaunchedEffect(route) { pop() }
                     }
                 }
             }
@@ -100,11 +117,8 @@ fun HomeControlRoot(ac: AcRepository, lights: LightsRepository) {
 private fun Header(
     ac: AcRepository,
     lights: LightsRepository,
-    showKeys: Boolean,
-    onToggleKeys: () -> Unit,
-    showDiagnostics: Boolean,
-    onToggleDiagnostics: () -> Unit,
-    onOpenNotifications: () -> Unit,
+    onOpenAcPage: (AcPage) -> Unit,
+    onAddRoom: () -> Unit,
 ) {
     val acState by ac.state.collectAsStateWithLifecycle()
     val lightState by lights.state.collectAsStateWithLifecycle()
@@ -137,10 +151,14 @@ private fun Header(
                     DropdownMenuItem(
                         text = { Text(if (acState.unreadAlerts > 0) "AC notifications (${acState.unreadAlerts})" else "AC notifications") },
                         trailingIcon = { Icon(Icons.Outlined.Cloud, contentDescription = "Uses the MirAIe cloud", modifier = Modifier.size(16.dp)) },
-                        onClick = { menuOpen = false; onOpenNotifications() },
+                        onClick = { menuOpen = false; onOpenAcPage(AcPage.Notifications) },
                     )
-                    CheckItem("Show AC keys", showKeys) { onToggleKeys(); menuOpen = false }
-                    CheckItem("AC diagnostics", showDiagnostics) { onToggleDiagnostics(); menuOpen = false }
+                    acState.devices.firstOrNull()?.let { first ->
+                        DropdownMenuItem(
+                            text = { Text("AC keys and diagnostics") },
+                            onClick = { menuOpen = false; onOpenAcPage(AcPage.More(first.device.deviceId)) },
+                        )
+                    }
                     CheckItem("Try local control (experimental)", acState.experimentalLocal) {
                         ac.setExperimentalLocal(!acState.experimentalLocal)
                     }
@@ -156,6 +174,8 @@ private fun Header(
                     DropdownMenuItem(text = { Text("Sign out of MirAIe") }, onClick = { ac.logout(); menuOpen = false })
                     HorizontalDivider()
                 }
+                DropdownMenuItem(text = { Text("Add light room") }, onClick = { menuOpen = false; onAddRoom() })
+                HorizontalDivider()
                 DropdownMenuItem(
                     text = { Text("Close app") },
                     onClick = { menuOpen = false; (context as? Activity)?.finishAndRemoveTask() },

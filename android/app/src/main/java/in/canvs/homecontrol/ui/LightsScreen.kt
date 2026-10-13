@@ -81,6 +81,13 @@ import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.ui.graphics.compositeOver
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.foundation.layout.heightIn
 
 private val SWATCHES = listOf(
     Triple(255, 59, 48), Triple(255, 149, 0), Triple(255, 214, 10), Triple(52, 199, 89),
@@ -88,22 +95,27 @@ private val SWATCHES = listOf(
 )
 
 @Composable
-fun LightsScreen(repo: LightsRepository) {
+fun LightsScreen(
+    repo: LightsRepository,
+    listState: LazyListState = rememberLazyListState(),
+    addRoomRequest: Int = 0,
+    onOpenBulb: (String) -> Unit = {},
+) {
     val state by repo.state.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
-    var renaming by remember { mutableStateOf<Bulb?>(null) }
 
     LaunchedEffect(Unit) { if (state.bulbs.isEmpty()) repo.discover() }
 
     LazyColumn(
         Modifier.fillMaxSize(),
+        state = listState,
         contentPadding = PaddingValues(start = Metrics.screenPadding, end = Metrics.screenPadding, bottom = 24.dp),
         verticalArrangement = Arrangement.spacedBy(Metrics.sectionSpacing),
     ) {
         item {
             SectionHeader(
                 title = "Lights",
-                detail = if (state.bulbs.isEmpty()) null else "${state.bulbs.size} found",
+                detail = if (state.bulbs.isEmpty()) null else "${state.bulbs.count { it.on }} of ${state.bulbs.size} on",
                 busy = state.scanning,
                 refreshLabel = "Scan for WiZ bulbs",
             ) { scope.launch { repo.discover() } }
@@ -126,35 +138,266 @@ fun LightsScreen(repo: LightsRepository) {
                 ) { scope.launch { repo.discover() } }
             }
         }
-        if (state.presets.isNotEmpty()) item { PresetsRow(state.presets, repo) }
+        if (state.presets.isNotEmpty()) item(key = "presets") { PresetsRow(state.presets, repo) }
         val roomed = state.rooms.flatMap { it.macs }.toSet()
         state.rooms.forEach { room ->
             val bulbs = state.bulbs.filter { it.mac in room.macs }
             item(key = "room-${room.id}") { RoomCard(room, bulbs, repo) }
-            // Indented under their room so membership reads at a glance.
-            items(bulbs, key = { "${room.id}-${it.mac}" }) { bulb ->
-                Box(Modifier.padding(start = 16.dp)) { BulbCard(bulb, repo, state.rooms) { renaming = bulb } }
+            bulbs.chunked(2).forEachIndexed { i, pair ->
+                item(key = "room-${room.id}-row-$i") { TileRow(pair, repo, onOpenBulb) }
             }
         }
         val others = state.bulbs.filter { it.mac !in roomed }
-        if (state.rooms.isNotEmpty() && others.isNotEmpty()) {
-            item(key = "others") { Label("Other lights", Modifier.padding(top = 4.dp)) }
+        if (others.isNotEmpty()) {
+            if (state.rooms.isNotEmpty()) {
+                item(key = "others") { SectionLabel("Other lights") }
+            }
+            others.chunked(2).forEachIndexed { i, pair ->
+                item(key = "others-row-$i") { TileRow(pair, repo, onOpenBulb) }
+            }
         }
-        items(others, key = { it.mac }) { bulb -> BulbCard(bulb, repo, state.rooms) { renaming = bulb } }
-        if (state.bulbs.isNotEmpty()) item(key = "add-room") { AddRoomButton(repo) }
+        item(key = "add-room") { AddRoomButton(repo, addRoomRequest, visible = state.bulbs.isNotEmpty()) }
     }
+}
 
-    renaming?.let { bulb ->
-        var name by remember(bulb.mac) { mutableStateOf(bulb.name) }
-        AlertDialog(
-            onDismissRequest = { renaming = null },
-            title = { Text("Rename bulb") },
-            text = { OutlinedTextField(name, { name = it }, singleLine = true, label = { Text("Name") }) },
-            confirmButton = {
-                TextButton(onClick = { repo.rename(bulb.mac, name.trim().ifEmpty { bulb.name }); renaming = null }) { Text("Save") }
-            },
-            dismissButton = { TextButton(onClick = { renaming = null }) { Text("Cancel") } },
+@Composable
+private fun SectionLabel(text: String) {
+    Text(
+        text,
+        style = MaterialTheme.typography.titleSmall,
+        fontWeight = FontWeight.SemiBold,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(top = 4.dp).semantics { heading() },
+    )
+}
+
+/** Two bulb tiles side by side; a lone tile keeps half width. */
+@Composable
+private fun TileRow(pair: List<Bulb>, repo: LightsRepository, onOpen: (String) -> Unit) {
+    Row(horizontalArrangement = Arrangement.spacedBy(Metrics.sectionSpacing)) {
+        pair.forEach { b -> BulbTile(b, repo, Modifier.weight(1f)) { onOpen(b.mac) } }
+        if (pair.size == 1) Spacer(Modifier.weight(1f))
+    }
+}
+
+/**
+ * Bulb tile: glowing icon (tap toggles) + name + status. Tap the tile body to open the bulb page.
+ * The tile is tinted with the bulb's colour when on.
+ */
+@Composable
+private fun BulbTile(bulb: Bulb, repo: LightsRepository, modifier: Modifier, onOpen: () -> Unit) {
+    val light = lightColor(bulb)
+    val shape = RoundedCornerShape(Metrics.cardRadius)
+    val base = MaterialTheme.colorScheme.surfaceContainerLow
+    val fill = if (bulb.on) light.copy(alpha = 0.16f).compositeOver(base) else base
+    Column(
+        modifier
+            .shadow(3.dp, shape, ambientColor = Color.Black.copy(alpha = 0.08f), spotColor = Color.Black.copy(alpha = 0.12f))
+            .clip(shape)
+            .background(fill)
+            .pressable(onClick = onOpen)
+            .semantics { contentDescription = "${bulb.name}, ${statusText(bulb)}. Opens light settings" }
+            .padding(Metrics.cardPadding),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                Modifier
+                    .size(48.dp)
+                    .pressable(role = Role.Switch) { repo.setOn(bulb.mac, !bulb.on) }
+                    .semantics { contentDescription = "${bulb.name} power"; stateDescription = if (bulb.on) "On" else "Off" },
+                contentAlignment = Alignment.Center,
+            ) {
+                Box(
+                    Modifier
+                        .size(44.dp)
+                        .then(if (bulb.on) Modifier.shadow(8.dp, CircleShape, ambientColor = light, spotColor = light) else Modifier)
+                        .clip(CircleShape)
+                        .background(if (bulb.on) light else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    CrossfadeIcon(
+                        if (bulb.on) Icons.Filled.Lightbulb else Icons.Outlined.Lightbulb,
+                        tint = if (bulb.on) Color.Black.copy(alpha = 0.75f) else MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(22.dp),
+                    )
+                }
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        Text(bulb.name, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Text(
+            statusText(bulb),
+            style = MaterialTheme.typography.bodySmall.copy(fontFeatureSettings = "tnum"),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
         )
+    }
+}
+
+/** Bulb page: brightness, white, colour, scene + speed, presets, identify, rename, room. */
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
+@Composable
+fun BulbPage(repo: LightsRepository, mac: String, onBack: () -> Unit) {
+    val state by repo.state.collectAsStateWithLifecycle()
+    val bulb = state.bulbs.firstOrNull { it.mac == mac }
+    var renaming by remember { mutableStateOf(false) }
+    Column(Modifier.fillMaxSize()) {
+        PageBar(bulb?.name ?: "Light", bulb?.let { statusText(it) }, onBack) {
+            if (bulb != null) {
+                Box(Modifier.size(52.dp), contentAlignment = Alignment.Center) {
+                    PowerButton(bulb.on, label = "${bulb.name} power", tint = Color(0xFFFF9F0A)) { repo.setOn(bulb.mac, !bulb.on) }
+                }
+            }
+        }
+        if (bulb == null) {
+            EmptyState(icon = Icons.Outlined.LightbulbCircle, title = "Light not found", message = "Go back and scan again.")
+            return@Column
+        }
+        var dimming by remember(bulb.mac, bulb.dimming) { mutableFloatStateOf(bulb.dimming.toFloat()) }
+        var kelvin by remember(bulb.mac, bulb.temp) { mutableFloatStateOf((bulb.temp ?: 4000).toFloat()) }
+        var hue by remember(bulb.mac) { mutableFloatStateOf(0f) }
+        var speed by remember(bulb.mac, bulb.speed) { mutableFloatStateOf((bulb.speed ?: 100).toFloat()) }
+        val light = lightColor(bulb)
+        LazyColumn(
+            Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(start = Metrics.screenPadding, end = Metrics.screenPadding, bottom = 24.dp, top = 4.dp),
+            verticalArrangement = Arrangement.spacedBy(Metrics.sectionSpacing),
+        ) {
+            item {
+                HomeCard(tint = if (bulb.on) light else null) {
+                    CardTitle("Brightness") {
+                        Text("${dimming.roundToInt()}%", style = MaterialTheme.typography.titleSmall.copy(fontFeatureSettings = "tnum"))
+                    }
+                    Slider(
+                        value = dimming,
+                        onValueChange = { dimming = it },
+                        onValueChangeFinished = { repo.setBrightness(bulb.mac, dimming.roundToInt()) },
+                        valueRange = 10f..100f,
+                        colors = SliderDefaults.colors(
+                            thumbColor = light,
+                            activeTrackColor = light,
+                            inactiveTrackColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.1f),
+                            inactiveTickColor = Color.Transparent,
+                            activeTickColor = Color.Transparent,
+                        ),
+                        modifier = Modifier.semantics { contentDescription = "Brightness" },
+                    )
+                    if (!bulb.on) Text("Turning brightness up also turns the light on.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+            item {
+                HomeCard {
+                    CardTitle("White")
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Warm", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Slider(
+                            value = kelvin,
+                            onValueChange = { kelvin = it },
+                            onValueChangeFinished = { repo.setTemperature(bulb.mac, kelvin.roundToInt()) },
+                            valueRange = 2200f..6500f,
+                            colors = SliderDefaults.colors(thumbColor = MaterialTheme.colorScheme.onSurface),
+                            track = { GradientTrack(WHITES) },
+                            modifier = Modifier.weight(1f).padding(horizontal = 8.dp).semantics { contentDescription = "Color temperature" },
+                        )
+                        Text("Cool", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            }
+            item {
+                HomeCard {
+                    CardTitle("Colour")
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        SWATCHES.forEach { rgb -> Swatch(rgb, selected = bulb.rgb == rgb) { repo.setColor(bulb.mac, rgb.first, rgb.second, rgb.third) } }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Slider(
+                        value = hue,
+                        onValueChange = { hue = it },
+                        onValueChangeFinished = {
+                            val c = android.graphics.Color.HSVToColor(floatArrayOf(hue, 1f, 1f))
+                            repo.setColor(bulb.mac, android.graphics.Color.red(c), android.graphics.Color.green(c), android.graphics.Color.blue(c))
+                        },
+                        valueRange = 0f..360f,
+                        colors = SliderDefaults.colors(thumbColor = MaterialTheme.colorScheme.onSurface),
+                        track = { GradientTrack(HUES) },
+                        modifier = Modifier.semantics { contentDescription = "Custom color hue" },
+                    )
+                }
+            }
+            item {
+                HomeCard {
+                    CardTitle("Scene") { SceneMenu(bulb.sceneId) { repo.setScene(bulb.mac, it) } }
+                    if (bulb.on && bulb.sceneId > 0) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("Slow", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Slider(
+                                value = speed,
+                                onValueChange = { speed = it },
+                                onValueChangeFinished = { repo.setSpeed(bulb.mac, speed.roundToInt()) },
+                                valueRange = 10f..200f,
+                                colors = SliderDefaults.colors(
+                                    thumbColor = light,
+                                    activeTrackColor = light,
+                                    inactiveTrackColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.1f),
+                                    inactiveTickColor = Color.Transparent,
+                                    activeTickColor = Color.Transparent,
+                                ),
+                                modifier = Modifier.weight(1f).padding(horizontal = 8.dp).semantics { contentDescription = "Scene speed" },
+                            )
+                            Text("Fast", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    } else {
+                        Text("Pick a scene to see its speed control.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            }
+            item {
+                HomeCard {
+                    CardTitle("Light")
+                    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text("Name", style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+                        TextButton(onClick = { renaming = true }) { Text("Rename") }
+                    }
+                    HorizontalDivider()
+                    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text("Room", style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+                        if (state.rooms.isEmpty()) {
+                            Text("Add a room first", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        } else {
+                            RoomMenu(state.rooms, state.rooms.firstOrNull { bulb.mac in it.macs }) { repo.assignBulb(bulb.mac, it?.id) }
+                        }
+                    }
+                    HorizontalDivider()
+                    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text("Find this light", style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+                        TextButton(onClick = { repo.identify(bulb.mac) }) { Text("Identify") }
+                    }
+                    HorizontalDivider()
+                    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text("Preset", style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+                        SavePresetButton(repo, listOf(bulb.mac), compact = true)
+                    }
+                    HorizontalDivider()
+                    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text("IP address", style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+                        Text(bulb.ip, style = MaterialTheme.typography.bodyMedium.copy(fontFeatureSettings = "tnum"), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            }
+        }
+        if (renaming) {
+            var name by remember(bulb.mac) { mutableStateOf(bulb.name) }
+            AlertDialog(
+                onDismissRequest = { renaming = false },
+                title = { Text("Rename light") },
+                text = { OutlinedTextField(name, { name = it }, singleLine = true, label = { Text("Name") }) },
+                confirmButton = {
+                    TextButton(onClick = { repo.rename(bulb.mac, name.trim().ifEmpty { bulb.name }); renaming = false }) { Text("Save") }
+                },
+                dismissButton = { TextButton(onClick = { renaming = false }) { Text("Cancel") } },
+            )
+        }
     }
 }
 
@@ -173,170 +416,6 @@ private fun QuickAction(title: String, icon: androidx.compose.ui.graphics.vector
         Icon(icon, null, tint = tint ?: MaterialTheme.colorScheme.onSurface, modifier = Modifier.size(18.dp))
         Spacer(Modifier.width(6.dp))
         Text(title, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Medium)
-    }
-}
-
-@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
-@Composable
-private fun BulbCard(bulb: Bulb, repo: LightsRepository, rooms: List<LightRoom>, onRename: () -> Unit) {
-    val density = LocalDensity.current.density
-    var expanded by rememberSaveable(bulb.mac) { mutableStateOf(false) }
-    var dimming by remember(bulb.mac, bulb.dimming) { mutableFloatStateOf(bulb.dimming.toFloat()) }
-    var kelvin by remember(bulb.mac, bulb.temp) { mutableFloatStateOf((bulb.temp ?: 4000).toFloat()) }
-    var hue by remember(bulb.mac) { mutableFloatStateOf(0f) }
-    var speed by remember(bulb.mac, bulb.speed) { mutableFloatStateOf((bulb.speed ?: 100).toFloat()) }
-    val light = lightColor(bulb)
-
-    HomeCard(tint = if (bulb.on) light else null) {
-        // Header
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Box(
-                Modifier
-                    .size(52.dp)
-                    .pressable(role = Role.Switch) { repo.setOn(bulb.mac, !bulb.on) }
-                    .semantics { contentDescription = "${bulb.name} power"; stateDescription = if (bulb.on) "On" else "Off" },
-                contentAlignment = Alignment.Center,
-            ) {
-                Box(
-                    Modifier
-                        .size(44.dp)
-                        .then(if (bulb.on) Modifier.shadow(8.dp, CircleShape, ambientColor = light, spotColor = light) else Modifier)
-                        .clip(CircleShape)
-                        .background(if (bulb.on) light else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f)),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Icon(
-                        if (bulb.on) Icons.Filled.Lightbulb else Icons.Outlined.Lightbulb,
-                        null,
-                        tint = if (bulb.on) Color.Black.copy(alpha = 0.75f) else MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.size(22.dp),
-                    )
-                }
-            }
-            Spacer(Modifier.width(8.dp))
-            Column(Modifier.weight(1f)) {
-                Text(bulb.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, maxLines = 1)
-                Text(statusText(bulb), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
-            }
-            Box(
-                Modifier
-                    .size(48.dp)
-                    .pressable { expanded = !expanded }
-                    .semantics { contentDescription = if (expanded) "Hide options" else "Show options" },
-                contentAlignment = Alignment.Center,
-            ) {
-                Box(
-                    Modifier.size(32.dp).clip(CircleShape)
-                        .background(MaterialTheme.colorScheme.onSurface.copy(alpha = if (expanded) 0.1f else 0.05f)),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Icon(Icons.Filled.KeyboardArrowDown, null, modifier = Modifier.size(20.dp).rotate(if (expanded) 180f else 0f))
-                }
-            }
-        }
-
-        // Brightness (only meaningful when on)
-        AnimatedVisibility(bulb.on, enter = revealEnter(density), exit = revealExit(density)) {
-            Row(Modifier.padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Outlined.WbSunny, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(16.dp))
-                Slider(
-                    value = dimming,
-                    onValueChange = { dimming = it },
-                    onValueChangeFinished = { repo.setBrightness(bulb.mac, dimming.roundToInt()) },
-                    valueRange = 10f..100f,
-                    colors = SliderDefaults.colors(
-                        thumbColor = light,
-                        activeTrackColor = light,
-                        inactiveTrackColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.1f),
-                        inactiveTickColor = Color.Transparent,
-                        activeTickColor = Color.Transparent,
-                    ),
-                    modifier = Modifier.weight(1f).padding(horizontal = 8.dp).semantics { contentDescription = "Brightness" },
-                )
-                Text(
-                    "${dimming.roundToInt()}%",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.width(40.dp),
-                )
-            }
-        }
-
-        // Details
-        AnimatedVisibility(expanded, enter = revealEnter(density), exit = revealExit(density)) {
-            Column(Modifier.padding(top = 8.dp)) {
-                Label("White")
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("Warm", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Slider(
-                        value = kelvin,
-                        onValueChange = { kelvin = it },
-                        onValueChangeFinished = { repo.setTemperature(bulb.mac, kelvin.roundToInt()) },
-                        valueRange = 2200f..6500f,
-                        colors = SliderDefaults.colors(thumbColor = MaterialTheme.colorScheme.onSurface),
-                        track = { GradientTrack(WHITES) },
-                        modifier = Modifier.weight(1f).padding(horizontal = 8.dp).semantics { contentDescription = "Color temperature" },
-                    )
-                    Text("Cool", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-
-                Spacer(Modifier.height(8.dp))
-                Label("Color")
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    SWATCHES.forEach { rgb -> Swatch(rgb, selected = bulb.rgb == rgb) { repo.setColor(bulb.mac, rgb.first, rgb.second, rgb.third) } }
-                }
-                Spacer(Modifier.height(4.dp))
-                Slider(
-                    value = hue,
-                    onValueChange = { hue = it },
-                    onValueChangeFinished = {
-                        val c = android.graphics.Color.HSVToColor(floatArrayOf(hue, 1f, 1f))
-                        repo.setColor(bulb.mac, android.graphics.Color.red(c), android.graphics.Color.green(c), android.graphics.Color.blue(c))
-                    },
-                    valueRange = 0f..360f,
-                    colors = SliderDefaults.colors(thumbColor = MaterialTheme.colorScheme.onSurface),
-                    track = { GradientTrack(HUES) },
-                    modifier = Modifier.semantics { contentDescription = "Custom color hue" },
-                )
-
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Label("Scene", Modifier.weight(1f))
-                    SceneMenu(bulb.sceneId) { repo.setScene(bulb.mac, it) }
-                }
-                if (bulb.on && bulb.sceneId > 0) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text("Slow", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        Slider(
-                            value = speed,
-                            onValueChange = { speed = it },
-                            onValueChangeFinished = { repo.setSpeed(bulb.mac, speed.roundToInt()) },
-                            valueRange = 10f..200f,
-                            colors = SliderDefaults.colors(
-                                thumbColor = light,
-                                activeTrackColor = light,
-                                inactiveTrackColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.1f),
-                                inactiveTickColor = Color.Transparent,
-                                activeTickColor = Color.Transparent,
-                            ),
-                            modifier = Modifier.weight(1f).padding(horizontal = 8.dp).semantics { contentDescription = "Scene speed" },
-                        )
-                        Text("Fast", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                }
-                if (rooms.isNotEmpty()) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Label("Room", Modifier.weight(1f))
-                        RoomMenu(rooms, rooms.firstOrNull { bulb.mac in it.macs }) { repo.assignBulb(bulb.mac, it?.id) }
-                    }
-                }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(bulb.ip, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline, modifier = Modifier.weight(1f))
-                    SavePresetButton(repo, listOf(bulb.mac), compact = true)
-                    TextButton(onClick = { repo.identify(bulb.mac) }) { Text("Identify") }
-                    TextButton(onClick = onRename) { Text("Rename") }
-                }
-            }
-        }
     }
 }
 
@@ -389,9 +468,9 @@ private fun Swatch(rgb: Triple<Int, Int, Int>, selected: Boolean, onClick: () ->
 }
 
 @Composable
-private fun SceneMenu(sceneId: Int, onSelect: (Int) -> Unit) {
+private fun SceneMenu(sceneId: Int, placeholder: String = "None", onSelect: (Int) -> Unit) {
     var open by remember { mutableStateOf(false) }
-    val current = WizClient.SCENES.firstOrNull { it.first == sceneId }?.second ?: "None"
+    val current = WizClient.SCENES.firstOrNull { it.first == sceneId }?.second ?: placeholder
     Box {
         Row(
             Modifier
@@ -462,31 +541,38 @@ private fun RoomCard(room: LightRoom, bulbs: List<Bulb>, repo: LightsRepository)
     var menu by remember { mutableStateOf(false) }
     var renaming by remember { mutableStateOf(false) }
     var deleting by remember { mutableStateOf(false) }
+    var savingPreset by remember { mutableStateOf(false) }
     val avg = bulbs.filter { it.on }.map { it.dimming }.average().takeIf { !it.isNaN() } ?: 100.0
     var dimming by remember(room.id, avg) { mutableFloatStateOf(avg.toFloat()) }
     val tint = Color(0xFFFFCC00)
+    val accent = Color(0xFFFF9F0A)
 
     HomeCard(tint = if (anyOn) tint else null) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
-                Text(room.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, modifier = Modifier.semantics { heading() })
+                Text(room.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, maxLines = 1, modifier = Modifier.semantics { heading() })
                 Text(
-                    if (bulbs.isEmpty()) "No lights yet — assign them from a light's options" else "$onCount of ${bulbs.size} on",
+                    if (bulbs.isEmpty()) "No lights yet. Assign them from a light's page." else "$onCount of ${bulbs.size} on",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
+            if (bulbs.isNotEmpty()) {
+                val common = bulbs.map { it.sceneId }.distinct().singleOrNull() ?: 0
+                SceneMenu(common, placeholder = "Scene") { repo.setRoomScene(room.id, it) }
+            }
             Box {
                 RoundIconButton(Icons.Filled.MoreVert, "Room options", size = 36.dp) { menu = true }
                 DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                    if (bulbs.isNotEmpty()) DropdownMenuItem(text = { Text("Save as preset") }, onClick = { menu = false; savingPreset = true })
                     DropdownMenuItem(text = { Text("Rename room") }, onClick = { menu = false; renaming = true })
                     DropdownMenuItem(text = { Text("Delete room") }, onClick = { menu = false; deleting = true })
                 }
             }
-            if (bulbs.isNotEmpty()) PowerButton(anyOn, label = "${room.name} lights", tint = Color(0xFFFF9F0A)) { repo.setRoomOn(room.id, !anyOn) }
+            if (bulbs.isNotEmpty()) PowerButton(anyOn, label = "${room.name} lights", tint = accent) { repo.setRoomOn(room.id, !anyOn) }
         }
         if (bulbs.isNotEmpty()) {
-            Row(Modifier.padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+            Row(Modifier.padding(top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                 Icon(Icons.Outlined.WbSunny, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(16.dp))
                 Slider(
                     value = dimming,
@@ -494,26 +580,24 @@ private fun RoomCard(room: LightRoom, bulbs: List<Bulb>, repo: LightsRepository)
                     onValueChangeFinished = { repo.setRoomBrightness(room.id, dimming.roundToInt()) },
                     valueRange = 10f..100f,
                     colors = SliderDefaults.colors(
-                        thumbColor = Color(0xFFFF9F0A),
-                        activeTrackColor = Color(0xFFFF9F0A),
+                        thumbColor = accent,
+                        activeTrackColor = accent,
                         inactiveTrackColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.1f),
                         inactiveTickColor = Color.Transparent,
                         activeTickColor = Color.Transparent,
                     ),
                     modifier = Modifier.weight(1f).padding(horizontal = 8.dp).semantics { contentDescription = "${room.name} brightness" },
                 )
-                Text("${dimming.roundToInt()}%", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.width(40.dp))
-            }
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Label("Scene", Modifier.weight(1f))
-                val common = bulbs.map { it.sceneId }.distinct().singleOrNull() ?: 0
-                SceneMenu(common) { repo.setRoomScene(room.id, it) }
-            }
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                SavePresetButton(repo, bulbs.map { it.mac }, compact = false)
+                Text(
+                    "${dimming.roundToInt()}%",
+                    style = MaterialTheme.typography.bodySmall.copy(fontFeatureSettings = "tnum"),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.width(40.dp),
+                )
             }
         }
     }
+    if (savingPreset) PresetNameDialog(bulbs.size, onDismiss = { savingPreset = false }) { repo.savePreset(it, bulbs.map { b -> b.mac }) }
     if (renaming) {
         var name by remember { mutableStateOf(room.name) }
         AlertDialog(
@@ -536,13 +620,16 @@ private fun RoomCard(room: LightRoom, bulbs: List<Bulb>, repo: LightsRepository)
 }
 
 @Composable
-private fun AddRoomButton(repo: LightsRepository) {
+private fun AddRoomButton(repo: LightsRepository, request: Int, visible: Boolean) {
     var naming by remember { mutableStateOf(false) }
     var name by remember { mutableStateOf("") }
-    OutlinedButton(onClick = { name = ""; naming = true }, modifier = Modifier.fillMaxWidth().height(48.dp)) {
-        Icon(Icons.Filled.Add, null, modifier = Modifier.size(18.dp))
-        Spacer(Modifier.width(6.dp))
-        Text("Add room")
+    LaunchedEffect(request) { if (request > 0) { name = ""; naming = true } }
+    if (visible) {
+        OutlinedButton(onClick = { name = ""; naming = true }, modifier = Modifier.fillMaxWidth().height(48.dp)) {
+            Icon(Icons.Filled.Add, null, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(6.dp))
+            Text("Add room")
+        }
     }
     if (naming) {
         AlertDialog(
@@ -597,33 +684,36 @@ private fun RoomMenu(rooms: List<LightRoom>, current: LightRoom?, onSelect: (Lig
 @Composable
 private fun SavePresetButton(repo: LightsRepository, macs: List<String>, compact: Boolean) {
     var naming by remember { mutableStateOf(false) }
-    var name by remember { mutableStateOf("") }
-    TextButton(onClick = { name = ""; naming = true }) {
+    TextButton(onClick = { naming = true }) {
         if (!compact) {
             Icon(Icons.Outlined.Bookmark, null, modifier = Modifier.size(16.dp))
             Spacer(Modifier.width(6.dp))
         }
         Text(if (compact) "Save preset" else "Save as preset")
     }
-    if (naming) {
-        AlertDialog(
-            onDismissRequest = { naming = false },
-            title = { Text("Save preset") },
-            text = {
-                Column {
-                    Text(
-                        "Saves the current on/off, brightness, colour or scene of ${if (macs.size == 1) "this light" else "these ${macs.size} lights"}.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    Spacer(Modifier.height(8.dp))
-                    OutlinedTextField(name, { name = it.take(30) }, singleLine = true, label = { Text("Name, e.g. Movie") })
-                }
-            },
-            confirmButton = { TextButton(enabled = name.isNotBlank(), onClick = { repo.savePreset(name, macs); naming = false }) { Text("Save") } },
-            dismissButton = { TextButton(onClick = { naming = false }) { Text("Cancel") } },
-        )
-    }
+    if (naming) PresetNameDialog(macs.size, onDismiss = { naming = false }) { repo.savePreset(it, macs) }
+}
+
+@Composable
+private fun PresetNameDialog(count: Int, onDismiss: () -> Unit, onSave: (String) -> Unit) {
+    var name by remember { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Save preset") },
+        text = {
+            Column {
+                Text(
+                    "Saves the current on/off, brightness, colour or scene of ${if (count == 1) "this light" else "these $count lights"}.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(name, { name = it.take(30) }, singleLine = true, label = { Text("Name, e.g. Movie") })
+            }
+        },
+        confirmButton = { TextButton(enabled = name.isNotBlank(), onClick = { onSave(name); onDismiss() }) { Text("Save") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
 }
 
 /** Saved presets: tap to apply, long-press to delete. */
@@ -634,12 +724,12 @@ private fun PresetsRow(presets: List<LightPreset>, repo: LightsRepository) {
     var deleting by remember { mutableStateOf<LightPreset?>(null) }
     Column {
         Label("Presets")
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             presets.forEach { p ->
                 Row(
                     Modifier
-                        .height(40.dp)
-                        .clip(RoundedCornerShape(Metrics.tileRadius))
+                        .height(36.dp)
+                        .clip(CircleShape)
                         .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f))
                         .combinedClickable(
                             onClick = { repo.applyPreset(p) },

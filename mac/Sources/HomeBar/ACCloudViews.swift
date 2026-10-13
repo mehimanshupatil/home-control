@@ -32,41 +32,6 @@ extension ACDevice {
     }
 }
 
-/// Row of panel chips; the selected panel opens below inside the card.
-struct ACPanelBar: View {
-    let device: ACDevice
-    @Binding var selection: ACPanel?
-
-    var body: some View {
-        HStack(spacing: 4) {
-            ForEach(device.panels) { p in
-                OptionTile(title: p.title, symbol: p.symbol, selected: selection == p, compact: true) {
-                    selection = selection == p ? nil : p
-                }
-                .accessibilityLabel("\(p.title) panel")
-            }
-        }
-    }
-}
-
-struct ACPanelView: View {
-    let device: ACDevice
-    let panel: ACPanel
-
-    var body: some View {
-        Group {
-            switch panel {
-            case .energy: ACEnergyPanel(device: device)
-            case .sleep: ACSleepPanel(device: device)
-            case .filter: ACFilterPanel(device: device)
-            case .settings: ACSettingsPanel(device: device)
-            }
-        }
-        .padding(10)
-        .background(RoundedRectangle(cornerRadius: Metrics.tileRadius, style: .continuous).fill(Color.primary.opacity(0.04)))
-    }
-}
-
 /// "Uses MirAIe cloud" caption, or the blocker text in place of the panel body.
 struct CloudGate<Content: View>: View {
     @EnvironmentObject private var ac: ACStore
@@ -204,7 +169,12 @@ struct ACSleepPanel: View {
     @EnvironmentObject private var ac: ACStore
     let device: ACDevice
 
+    #if DEBUG
+    nonisolated(unsafe) static var debugEditing: SleepProfile?
+    @ViewState private var editing: SleepProfile? = ACSleepPanel.debugEditing
+    #else
     @ViewState private var editing: SleepProfile?
+    #endif
     @ViewState private var scheduling: SleepProfile?
     @ViewState private var busy = false
     @ViewState private var error: String?
@@ -586,35 +556,12 @@ struct ACSettingsPanel: View {
     }
 }
 
-// MARK: Active sleep profile pill (on the card)
-
-struct ACSleepStatus: View {
-    @EnvironmentObject private var ac: ACStore
-    let device: ACDevice
-
-    var body: some View {
-        if let id = device.activeSleepProfileId {
-            let p = (ac.sleepProfiles[device.id] ?? []).first { ($0.isDefault ? "default" : $0.id) == id }
-            HStack(spacing: 4) {
-                StatusPill(text: "Sleep: \(p?.displayName ?? "profile")", color: .indigo, symbol: "moon.zzz.fill")
-                if let p {
-                    Button { ac.setSleepProfile(device, p, on: false) } label: {
-                        Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.pressable)
-                    .help("Stop sleep profile")
-                    .accessibilityLabel("Stop sleep profile")
-                }
-            }
-        }
-    }
-}
-
 // MARK: Notifications
 
 struct ACNotificationsCard: View {
     @EnvironmentObject private var ac: ACStore
-    let close: () -> Void
+    /// Shown with a Hide button when embedded; nil on its own page.
+    var close: (() -> Void)? = nil
     @ViewState private var page = 1
     @ViewState private var loading = false
     @ViewState private var more = true
@@ -622,10 +569,12 @@ struct ACNotificationsCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Label("AC Notifications", systemImage: "bell").font(.subheadline.weight(.semibold))
-                Spacer()
-                Button("Hide", action: close).buttonStyle(.borderless).font(.caption)
+            if let close {
+                HStack {
+                    Label("AC Notifications", systemImage: "bell").font(.subheadline.weight(.semibold))
+                    Spacer()
+                    Button("Hide", action: close).buttonStyle(.borderless).font(.caption)
+                }
             }
             CloudGate(title: "History") {
                 VStack(alignment: .leading, spacing: 8) {

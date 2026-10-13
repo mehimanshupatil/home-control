@@ -25,6 +25,10 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.offset
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.outlined.Cloud
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -319,3 +323,139 @@ fun EmptyState(icon: ImageVector, title: String, message: String, actionTitle: S
 /** Expand/collapse: enter 300 ms with a 12 dp rise, exit 150 ms. System animation scale 0 makes both instant. */
 fun revealEnter(density: Float) = fadeIn(tween(300)) + slideInVertically(tween(300)) { (12 * density).toInt() }
 fun revealExit(density: Float) = fadeOut(tween(150)) + slideOutVertically(tween(150)) { -(12 * density).toInt() }
+
+// ---- navigation and redesign components (docs/UI.md) ---------------------------------------------------
+
+/** Page push: fade + 12 dp slide from the end edge over 300 ms; back: 150 ms. Animation scale 0 makes it instant. */
+fun pageTransition(forward: Boolean, density: Float): androidx.compose.animation.ContentTransform {
+    val d = (12 * density).toInt()
+    return if (forward) {
+        (fadeIn(tween(300, easing = androidx.compose.animation.core.FastOutSlowInEasing)) +
+            androidx.compose.animation.slideInHorizontally(tween(300)) { d }) togetherWith
+            fadeOut(tween(150))
+    } else {
+        fadeIn(tween(150)) togetherWith
+            (fadeOut(tween(150)) + androidx.compose.animation.slideOutHorizontally(tween(150)) { d })
+    }
+}
+
+private infix fun androidx.compose.animation.EnterTransition.togetherWith(exit: androidx.compose.animation.ExitTransition) =
+    androidx.compose.animation.ContentTransform(this, exit)
+
+/**
+ * Icon that cross-fades when it changes (scale 0.25 → 1 + alpha over 300 ms). Colour carries the state
+ * as a static cue, so the swap is never the only feedback.
+ */
+@Composable
+fun CrossfadeIcon(icon: ImageVector, tint: Color, modifier: Modifier = Modifier) {
+    androidx.compose.animation.AnimatedContent(
+        targetState = icon,
+        transitionSpec = {
+            androidx.compose.animation.ContentTransform(
+                fadeIn(tween(300)) + androidx.compose.animation.scaleIn(tween(300), initialScale = 0.25f),
+                fadeOut(tween(150)),
+            )
+        },
+        label = "icon",
+    ) { target -> Icon(target, contentDescription = null, tint = tint, modifier = modifier) }
+}
+
+/**
+ * Action-bar button: icon above a short label, neutral fill, opens a page. A dot marks pages with
+ * something active; a cloud glyph marks pages that need the MirAIe cloud. Not selectable.
+ */
+@Composable
+fun ActionButton(
+    label: String,
+    icon: ImageVector,
+    modifier: Modifier = Modifier,
+    active: Boolean = false,
+    cloud: Boolean = false,
+    onClick: () -> Unit,
+) {
+    Column(
+        modifier
+            .heightIn(min = 56.dp)
+            .clip(RoundedCornerShape(Metrics.tileRadius))
+            .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f))
+            .pressable(onClick = onClick)
+            .semantics {
+                contentDescription = label + (if (active) ", active" else "") + (if (cloud) ", uses the MirAIe cloud" else "")
+            }
+            .padding(vertical = 8.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Box {
+            Icon(icon, null, tint = MaterialTheme.colorScheme.onSurface, modifier = Modifier.size(20.dp))
+            if (active) {
+                Box(
+                    Modifier.align(Alignment.TopEnd).offset(x = 4.dp, y = (-2).dp).size(7.dp)
+                        .clip(CircleShape).background(MaterialTheme.colorScheme.primary),
+                )
+            } else if (cloud) {
+                Icon(
+                    Icons.Outlined.Cloud, null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.align(Alignment.TopEnd).offset(x = 8.dp, y = (-4).dp).size(11.dp),
+                )
+            }
+        }
+        Spacer(Modifier.height(4.dp))
+        Text(label, style = MaterialTheme.typography.labelMedium, maxLines = 1, color = MaterialTheme.colorScheme.onSurface)
+    }
+}
+
+/** Status pill with an optional dismiss (✕) action; 48 dp touch target for the ✕. */
+@Composable
+fun DismissiblePill(text: String, color: Color, icon: ImageVector?, dismissLabel: String?, onDismiss: (() -> Unit)?) {
+    val fg = if (isLightTheme()) lerp(color, Color.Black, 0.4f) else color
+    Row(
+        Modifier
+            .height(32.dp)
+            .clip(CircleShape)
+            .background(color.copy(alpha = 0.15f))
+            .padding(start = 10.dp, end = if (onDismiss != null) 0.dp else 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        if (icon != null) {
+            Icon(icon, contentDescription = null, tint = fg, modifier = Modifier.size(14.dp))
+            Spacer(Modifier.width(4.dp))
+        }
+        Text(text, color = fg, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold, maxLines = 1)
+        if (onDismiss != null) {
+            Box(
+                Modifier.size(32.dp).pressable(onClick = onDismiss).semantics { contentDescription = dismissLabel ?: "Dismiss" },
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(Icons.Filled.Close, null, tint = fg, modifier = Modifier.size(14.dp))
+            }
+        }
+    }
+}
+
+/** Page header: back button, title, subtitle, optional cloud caption. */
+@Composable
+fun PageBar(title: String, subtitle: String?, onBack: () -> Unit, trailing: (@Composable () -> Unit)? = null) {
+    Row(
+        Modifier.fillMaxWidth().padding(start = 4.dp, end = Metrics.screenPadding, top = 4.dp, bottom = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        RoundIconButton(Icons.AutoMirrored.Filled.ArrowBack, "Back", size = 40.dp, onClick = onBack)
+        Spacer(Modifier.width(4.dp))
+        Column(Modifier.weight(1f)) {
+            Text(title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold, maxLines = 1)
+            if (subtitle != null) Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
+        }
+        trailing?.invoke()
+    }
+}
+
+/** Small section title used inside page cards. */
+@Composable
+fun CardTitle(text: String, modifier: Modifier = Modifier, trailing: (@Composable () -> Unit)? = null) {
+    Row(modifier.fillMaxWidth().padding(bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text(text, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+        trailing?.invoke()
+    }
+}

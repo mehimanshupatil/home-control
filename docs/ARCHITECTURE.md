@@ -98,6 +98,9 @@ Stateless UDP JSON-RPC. Discovery broadcasts `getPilot` and collects replies key
 
 ## UI system (both apps)
 
+Layout and navigation are specified in [UI.md](UI.md): compact AC card with status pills and an action bar, detail pages (Timer, Sleep, Air, Energy, More) with back navigation, and Lights as room sections with a bulb tile grid.
+
+
 Shared visual rules so the apps look alike:
 - Cards: radius 18 = tile radius 6 + padding 12 (concentric). Elevation through soft layered shadows, not borders.
 - Mode colours: Cool blue, Heat orange, Dry teal, Fan green/mint, Auto purple. The card is tinted by mode when the AC is on; selected tiles go neutral when it's off.

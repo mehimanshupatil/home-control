@@ -26,6 +26,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.outlined.Bedtime
@@ -94,17 +95,21 @@ import java.text.DateFormat
 import java.util.Date
 import kotlin.math.roundToInt
 
-/** Full-screen AC pages opened from a card or the menu. Encoded as "kind:deviceId" for rememberSaveable. */
+/** Detail pages opened from an AC card's action bar or the menu (docs/UI.md). Encoded "kind:deviceId" for saved state. */
 sealed interface AcPage {
-    data class Energy(val deviceId: String) : AcPage
+    data class Timer(val deviceId: String) : AcPage
     data class Sleep(val deviceId: String) : AcPage
-    data class Settings(val deviceId: String) : AcPage
+    data class Air(val deviceId: String) : AcPage
+    data class Energy(val deviceId: String) : AcPage
+    data class More(val deviceId: String) : AcPage
     data object Notifications : AcPage
 
     fun encode(): String = when (this) {
-        is Energy -> "energy:$deviceId"
+        is Timer -> "timer:$deviceId"
         is Sleep -> "sleep:$deviceId"
-        is Settings -> "settings:$deviceId"
+        is Air -> "air:$deviceId"
+        is Energy -> "energy:$deviceId"
+        is More -> "more:$deviceId"
         Notifications -> "notifications:"
     }
 
@@ -112,9 +117,11 @@ sealed interface AcPage {
         fun decode(s: String?): AcPage? {
             val (kind, id) = s?.split(":", limit = 2)?.takeIf { it.size == 2 } ?: return null
             return when (kind) {
-                "energy" -> Energy(id)
+                "timer" -> Timer(id)
                 "sleep" -> Sleep(id)
-                "settings" -> Settings(id)
+                "air" -> Air(id)
+                "energy" -> Energy(id)
+                "more", "settings" -> More(id)
                 "notifications" -> Notifications
                 else -> null
             }
@@ -123,19 +130,33 @@ sealed interface AcPage {
 }
 
 @Composable
-fun AcPageHost(page: AcPage, repo: AcRepository, onBack: () -> Unit) {
+fun AcPageHost(page: AcPage, repo: AcRepository, onBack: () -> Unit, onOpen: (AcPage) -> Unit) {
     val state by repo.state.collectAsStateWithLifecycle()
-    val ac = (page as? AcPage.Energy)?.deviceId ?: (page as? AcPage.Sleep)?.deviceId ?: (page as? AcPage.Settings)?.deviceId
-    val device = ac?.let { id -> state.devices.firstOrNull { it.device.deviceId == id } }
+    val id = when (page) {
+        is AcPage.Timer -> page.deviceId
+        is AcPage.Sleep -> page.deviceId
+        is AcPage.Air -> page.deviceId
+        is AcPage.Energy -> page.deviceId
+        is AcPage.More -> page.deviceId
+        AcPage.Notifications -> null
+    }
+    val device = id?.let { d -> state.devices.firstOrNull { it.device.deviceId == d } }
+    val name = device?.device?.name
     when (page) {
-        is AcPage.Energy -> PageScaffold("Energy", device?.device?.name, cloud = true, onBack = onBack) {
-            if (device == null) item { MissingAc() } else if (!state.cloudAvailable) item { NeedsSignIn() } else item { EnergyContent(repo, device) }
+        is AcPage.Timer -> PageScaffold("Timer", name, cloud = false, onBack = onBack) {
+            if (device == null) item { MissingAc() } else item { TimerPanel(device, repo) }
         }
-        is AcPage.Sleep -> PageScaffold("Sleep profiles", device?.device?.name, cloud = true, onBack = onBack) {
+        is AcPage.Sleep -> PageScaffold("Sleep", name, cloud = true, onBack = onBack) {
             if (device == null) item { MissingAc() } else if (!state.cloudAvailable) item { NeedsSignIn() } else sleepContent(this, repo, device, state)
         }
-        is AcPage.Settings -> PageScaffold("AC settings", device?.device?.name, cloud = false, onBack = onBack) {
-            if (device == null) item { MissingAc() } else settingsContent(this, repo, device, state)
+        is AcPage.Air -> PageScaffold("Air", name, cloud = false, onBack = onBack) {
+            if (device == null) item { MissingAc() } else airContent(this, device, repo)
+        }
+        is AcPage.Energy -> PageScaffold("Energy", name, cloud = true, onBack = onBack) {
+            if (device == null) item { MissingAc() } else if (!state.cloudAvailable) item { NeedsSignIn() } else item { EnergyContent(repo, device) }
+        }
+        is AcPage.More -> PageScaffold("More", name, cloud = false, onBack = onBack) {
+            if (device == null) item { MissingAc() } else moreContent(this, repo, device, state, onOpen)
         }
         AcPage.Notifications -> PageScaffold("AC notifications", null, cloud = true, onBack = onBack) {
             if (!state.cloudAvailable) item { NeedsSignIn() } else item { NotificationsContent(repo) }
@@ -144,22 +165,9 @@ fun AcPageHost(page: AcPage, repo: AcRepository, onBack: () -> Unit) {
 }
 
 @Composable
-private fun PageScaffold(title: String, subtitle: String?, cloud: Boolean, onBack: () -> Unit, content: LazyListScope.() -> Unit) {
+internal fun PageScaffold(title: String, subtitle: String?, cloud: Boolean, onBack: () -> Unit, content: LazyListScope.() -> Unit) {
     Column(Modifier.fillMaxSize()) {
-        Row(
-            Modifier.fillMaxWidth().padding(start = 4.dp, end = Metrics.screenPadding, top = 4.dp, bottom = 4.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            RoundIconButton(Icons.AutoMirrored.Filled.ArrowBack, "Back", size = 40.dp, onClick = onBack)
-            Spacer(Modifier.width(4.dp))
-            Column(Modifier.weight(1f)) {
-                Text(title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
-                if (subtitle != null) {
-                    Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-            }
-            if (cloud) CloudCaption()
-        }
+        PageBar(title, subtitle, onBack, trailing = if (cloud) ({ CloudCaption() }) else null)
         LazyColumn(
             Modifier.fillMaxSize(),
             contentPadding = PaddingValues(start = Metrics.screenPadding, end = Metrics.screenPadding, bottom = 24.dp, top = 4.dp),
@@ -245,7 +253,7 @@ private fun EnergyChart(window: EnergyWindow) {
     val period = when (window.grain) {
         EnergyGrain.Daily -> "Last 7 days"
         EnergyGrain.Weekly -> "Last 7 weeks"
-        EnergyGrain.Monthly -> "Last 6 months"
+        EnergyGrain.Monthly -> "Last 7 months"
     }
     Text(period, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     Row(verticalAlignment = Alignment.Bottom) {
@@ -602,12 +610,43 @@ private fun fmtT(t: Double): String = if (t % 1.0 == 0.0) t.toInt().toString() e
 
 // ---- AC settings: name, room, filter, firmware ----------------------------------------------------------
 
-private fun settingsContent(scope: LazyListScope, repo: AcRepository, ac: AcState, state: AcUiState) = with(scope) {
-    item { NameRoomCard(repo, ac, state.cloudAvailable) }
+private fun moreContent(scope: LazyListScope, repo: AcRepository, ac: AcState, state: AcUiState, onOpen: (AcPage) -> Unit) = with(scope) {
     if (ac.spec("TimeBasedFilterHealth") != null || ac.spec("FilterCalibration") != null || ac.rawStatus.containsKey("filterDustLevel")) {
         item { FilterCard(repo, ac, state.cloudAvailable) }
     }
+    item { ProfilesCard(ac, repo, state.profiles[ac.device.deviceId].orEmpty()) }
+    item { NameRoomCard(repo, ac, state.cloudAvailable) }
     item { FirmwareCard(repo, ac, state.cloudAvailable) }
+    item {
+        HomeCard {
+            NavRow("AC notifications", if (state.unreadAlerts > 0) "${state.unreadAlerts} unread" else null, Icons.Outlined.Notifications, cloud = true) {
+                onOpen(AcPage.Notifications)
+            }
+        }
+    }
+    item { DiagnosticsCard(repo, state.devices, onHide = null) }
+    item { KeysCard(repo, state.devices, onHide = null) }
+}
+
+/** Row inside a card that opens another page. */
+@Composable
+internal fun NavRow(title: String, detail: String?, icon: ImageVector, cloud: Boolean, onClick: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().heightIn(min = 48.dp).clip(RoundedCornerShape(Metrics.tileRadius)).pressable(onClick = onClick),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(icon, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(20.dp))
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text(title, style = MaterialTheme.typography.bodyLarge)
+            if (detail != null) Text(detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        if (cloud) {
+            CloudCaption()
+            Spacer(Modifier.width(8.dp))
+        }
+        Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(20.dp))
+    }
 }
 
 @Composable
@@ -635,6 +674,7 @@ private fun NameRoomCard(repo: AcRepository, ac: AcState, cloud: Boolean) {
     var roomMenu by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     HomeCard {
+        CardTitle("AC settings")
         SettingRow("Name", ac.device.name, cloud = true) {
             TextButton(onClick = { renaming = true }, enabled = cloud) { Text("Rename") }
         }
@@ -845,33 +885,6 @@ private fun NotificationRow(n: AcNotification) {
                     modifier = Modifier.padding(top = 2.dp),
                 )
             }
-        }
-    }
-}
-
-/** Entry tile on the AC card for a sub-page. */
-@Composable
-fun NavTile(title: String, icon: ImageVector, detail: String?, cloud: Boolean, modifier: Modifier = Modifier, onClick: () -> Unit) {
-    Row(
-        modifier
-            .heightIn(min = 48.dp)
-            .clip(RoundedCornerShape(Metrics.tileRadius))
-            .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f))
-            .pressable(onClick = onClick)
-            .padding(horizontal = 10.dp, vertical = 6.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Icon(icon, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(18.dp))
-        Spacer(Modifier.width(6.dp))
-        Column(Modifier.weight(1f)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(title, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Medium, maxLines = 1)
-                if (cloud) {
-                    Spacer(Modifier.width(3.dp))
-                    Icon(Icons.Outlined.Cloud, "Uses the MirAIe cloud", tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(12.dp))
-                }
-            }
-            if (detail != null) Text(detail, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
         }
     }
 }

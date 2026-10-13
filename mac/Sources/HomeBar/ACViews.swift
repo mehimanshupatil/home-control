@@ -28,9 +28,6 @@ enum ACModeStyle {
 
 struct ACSection: View {
     @EnvironmentObject private var ac: ACStore
-    @AppStorage("showACKeys") private var showACKeys = false
-    @AppStorage("showACDiagnostics") private var showDiagnostics = false
-    @AppStorage("showACNotifications") private var showNotifications = false
 
     var body: some View {
         if !ac.loggedIn {
@@ -59,18 +56,6 @@ struct ACSection: View {
 
                 ForEach(ac.devices) { device in
                     ACCard(device: device)
-                }
-
-                if showACKeys {
-                    ACKeysCard { showACKeys = false }
-                }
-
-                if showNotifications {
-                    ACNotificationsCard { showNotifications = false }
-                }
-
-                if showDiagnostics {
-                    ACDiagnosticsCard { showDiagnostics = false }
                 }
             }
         }
@@ -115,23 +100,10 @@ struct ErrorBanner: View {
     }
 }
 
+/// Compact AC card (docs/UI.md): header, temperature, mode, fan, active-state chips, profiles, action bar.
 struct ACCard: View {
     @EnvironmentObject private var ac: ACStore
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let device: ACDevice
-
-    #if DEBUG
-    nonisolated(unsafe) static var debugExpandMore = false
-    @ViewState private var showMore = ACCard.debugExpandMore
-    #else
-    @ViewState private var showMore = false
-    #endif
-    #if DEBUG
-    nonisolated(unsafe) static var debugPanel: ACPanel?
-    @ViewState private var panel: ACPanel? = ACCard.debugPanel
-    #else
-    @ViewState private var panel: ACPanel?
-    #endif
 
     private var state: ACState { device.state }
     private var tint: Color { ACModeStyle.tint(state.mode) }
@@ -140,25 +112,13 @@ struct ACCard: View {
         VStack(alignment: .leading, spacing: 12) {
             header
             temperatureRow
-            ACInfoRow(device: device)
-            ACSleepStatus(device: device)
-            controls
-            if device.timerRange != nil {
-                ACTimerRow(device: device)
-            }
+            modeRow
+            fanRow
+            ACStatusChips(device: device)
             if !(ac.profiles[device.id] ?? []).isEmpty {
                 ACProfilesRow(device: device)
             }
-            moreToggle
-            if showMore {
-                ACMoreControls(device: device, tint: tint)
-                    .transition(.reveal(reduceMotion: reduceMotion))
-            }
-            ACPanelBar(device: device, selection: $panel)
-            if let panel {
-                ACPanelView(device: device, panel: panel)
-                    .transition(.reveal(reduceMotion: reduceMotion))
-            }
+            ACActionBar(device: device)
         }
         .card(tint: state.power ? tint : nil)
         .animation(.easeOut(duration: 0.15), value: state.power)
@@ -166,7 +126,7 @@ struct ACCard: View {
 
     private var header: some View {
         HStack(alignment: .center, spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 3) {
                 Text(device.name)
                     .font(.headline)
                     .lineLimit(1)
@@ -175,6 +135,13 @@ struct ACCard: View {
                         Text(device.space).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                     }
                     TransportBadge(transport: device.transport, online: state.online)
+                    if let rssi = state.raw["rssi"]?.doubleValue, rssi < 0 {
+                        Image(systemName: "wifi", variableValue: Self.signal(rssi))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .help(String(format: "Wi-Fi signal %.0f dBm", rssi))
+                            .accessibilityLabel(String(format: "Wi-Fi signal %.0f dBm", rssi))
+                    }
                 }
             }
             Spacer(minLength: 8)
@@ -187,95 +154,88 @@ struct ACCard: View {
     private var temperatureRow: some View {
         HStack(alignment: .center, spacing: 12) {
             VStack(alignment: .leading, spacing: 0) {
-                Text(state.power ? "Set to" : "Off")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
                 Text(Self.format(device.tempRange.step >= 1 ? state.setTemp.rounded() : state.setTemp))
-                    .font(.system(size: 40, weight: .semibold, design: .rounded))
+                    .font(.system(size: 44, weight: .semibold, design: .rounded))
                     .monospacedDigit()
                     .foregroundStyle(state.power ? Color.primary : Color.secondary)
                     .accessibilityLabel("Target temperature \(Self.format(state.setTemp))")
-            }
-            Spacer()
-            VStack(alignment: .trailing, spacing: 8) {
-                if let room = state.roomTemp {
-                    Label("Room \(String(format: "%.0f°", room))", systemImage: "thermometer.medium")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .monospacedDigit()
-                }
-                HStack(spacing: 8) {
-                    let range = device.tempRange
-                    RoundIconButton(symbol: "minus", size: 32, help: "Decrease temperature") {
-                        ac.setTemp(device, state.setTemp - range.step)
-                    }
-                    .disabled(state.setTemp <= range.min)
-                    RoundIconButton(symbol: "plus", size: 32, help: "Increase temperature") {
-                        ac.setTemp(device, state.setTemp + range.step)
-                    }
-                    .disabled(state.setTemp >= range.max)
-                }
-            }
-        }
-    }
-
-    private var moreToggle: some View {
-        Button { showMore.toggle() } label: {
-            HStack(spacing: 6) {
-                Text(showMore ? "Fewer controls" : "More controls")
-                    .font(.caption.weight(.medium))
-                Spacer()
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 10, weight: .semibold))
-                    .rotationEffect(.degrees(showMore ? 180 : 0))
-            }
-            .foregroundStyle(.secondary)
-            .padding(.horizontal, 10)
-            .frame(height: 28)
-            .background(RoundedRectangle(cornerRadius: Metrics.tileRadius, style: .continuous).fill(Color.primary.opacity(0.04)))
-        }
-        .buttonStyle(.pressable)
-        .accessibilityLabel(showMore ? "Hide extra controls" : "Show extra controls")
-    }
-
-    private var controls: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 4) {
-                ForEach(device.modeOptions, id: \.self) { mode in
-                    OptionTile(
-                        title: mode.capitalized,
-                        symbol: ACModeStyle.symbol(mode),
-                        selected: state.mode == mode,
-                        tint: ACModeStyle.tint(mode),
-                        muted: !state.power
-                    ) { ac.setMode(device, mode) }
-                }
-            }
-            .accessibilityElement(children: .contain)
-            .accessibilityLabel("Mode")
-
-            HStack(spacing: 6) {
-                Image(systemName: "fan")
+                Text(caption)
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                    .frame(width: 16)
-                    .accessibilityHidden(true)
-                HStack(spacing: 4) {
-                    ForEach(device.fanOptions, id: \.self) { speed in
-                        OptionTile(
-                            title: ACModeStyle.fanTitle(speed),
-                            symbol: "",
-                            selected: state.fan == speed,
-                            tint: tint,
-                            compact: true,
-                            muted: !state.power
-                        ) { ac.setFan(device, speed) }
-                    }
+                    .monospacedDigit()
+                    .lineLimit(1)
+            }
+            Spacer()
+            HStack(spacing: 8) {
+                let range = device.tempRange
+                RoundIconButton(symbol: "minus", size: 32, help: "Decrease temperature") {
+                    ac.setTemp(device, state.setTemp - range.step)
+                }
+                .disabled(state.setTemp <= range.min)
+                RoundIconButton(symbol: "plus", size: 32, help: "Increase temperature") {
+                    ac.setTemp(device, state.setTemp + range.step)
+                }
+                .disabled(state.setTemp >= range.max)
+            }
+        }
+    }
+
+    /// "Off · Room 29° · 62% humidity · 840 W" — only the parts the AC reports.
+    private var caption: String {
+        var parts: [String] = []
+        if !state.power { parts.append("Off") }
+        if let room = state.roomTemp { parts.append(String(format: "Room %.0f°", room)) }
+        if let cap = device.capability("RoomHumidity"), cap.key != cap.name, let h = state.raw[cap.key]?.doubleValue {
+            parts.append(String(format: "%.0f%% humidity", h))
+        }
+        if let cap = device.capability("CurrentPowerConsumption"), cap.key != cap.name, let w = state.raw[cap.key]?.doubleValue {
+            parts.append(String(format: "%.0f W", w))
+        }
+        return parts.isEmpty ? (state.power ? "Set temperature" : "Off") : parts.joined(separator: " · ")
+    }
+
+    private var modeRow: some View {
+        HStack(spacing: 4) {
+            ForEach(device.modeOptions, id: \.self) { mode in
+                OptionTile(
+                    title: mode.capitalized,
+                    symbol: ACModeStyle.symbol(mode),
+                    selected: state.mode == mode,
+                    tint: ACModeStyle.tint(mode),
+                    muted: !state.power
+                ) { ac.setMode(device, mode) }
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Mode")
+    }
+
+    private var fanRow: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "fan")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 16)
+                .accessibilityHidden(true)
+            HStack(spacing: 4) {
+                ForEach(device.fanOptions, id: \.self) { speed in
+                    OptionTile(
+                        title: ACModeStyle.fanTitle(speed),
+                        symbol: "",
+                        selected: state.fan == speed,
+                        tint: tint,
+                        compact: true,
+                        muted: !state.power
+                    ) { ac.setFan(device, speed) }
                 }
             }
-            .accessibilityElement(children: .contain)
-            .accessibilityLabel("Fan speed")
         }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Fan speed")
+    }
+
+    static func signal(_ rssi: Double) -> Double {
+        rssi >= -55 ? 1 : rssi >= -67 ? 0.67 : rssi >= -80 ? 0.34 : 0
     }
 
     static func format(_ t: Double) -> String {
@@ -373,14 +333,17 @@ struct LoginView: View {
 struct ACKeysCard: View {
     @EnvironmentObject private var ac: ACStore
     @ViewState private var copied = false
-    let close: () -> Void
+    /// Shown with a Hide button when embedded; nil on its own page.
+    var close: (() -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Label("AC Keys", systemImage: "key.fill").font(.subheadline.weight(.semibold))
-                Spacer()
-                Button("Hide", action: close).buttonStyle(.borderless).font(.caption)
+            if let close {
+                HStack {
+                    Label("AC Keys", systemImage: "key.fill").font(.subheadline.weight(.semibold))
+                    Spacer()
+                    Button("Hide", action: close).buttonStyle(.borderless).font(.caption)
+                }
             }
             Text("These keys control your ACs over Wi-Fi with no Panasonic sign-in. Anyone on your network who has them can control your ACs, so keep them private.")
                 .font(.caption)

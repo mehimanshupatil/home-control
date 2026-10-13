@@ -37,75 +37,70 @@ struct FlowLayout: Layout {
     }
 }
 
-// MARK: Info row
+// MARK: Status chips
 
-/// Read-only status chips from the keys real ACs report (PROTOCOL.md §1.8): Wi-Fi signal,
-/// filter, errors and warnings, plus humidity / PM2.5 / power when the model declares them.
-struct ACInfoRow: View {
+/// Card chips for states that matter right now (docs/UI.md): timers, running sleep profile, Clean running,
+/// filter alert, errors, warnings, PM2.5. Nothing is shown in the normal state.
+struct ACStatusChips: View {
+    @EnvironmentObject private var ac: ACStore
     let device: ACDevice
 
-    private enum Style { case plain, warning, fault }
-
-    private struct Item: Identifiable {
-        let id: String
-        let text: String
-        let symbol: String
-        var style: Style = .plain
-        var help: String? = nil
-        var signal: Double? = nil
-    }
-
-    private var items: [Item] {
+    var body: some View {
         let raw = device.state.raw
-        func declared(_ name: String) -> JSONValue? {
-            guard let cap = device.capability(name), cap.key != name else { return nil }
-            return raw[cap.key]
+        let timers: [(ACStore.TimerSlot, Date)] = [ACStore.TimerSlot.off, .on].compactMap { s in
+            ac.timerDate(device, s).map { (s, $0) }
         }
-        func text(_ key: String) -> String {
-            raw[key]?.stringValue?.trimmingCharacters(in: .whitespaces) ?? ""
-        }
-        var out: [Item] = []
-        if let rssi = raw["rssi"]?.doubleValue, rssi < 0 {
-            let bars = rssi >= -55 ? 3.0 : rssi >= -67 ? 2 : rssi >= -80 ? 1 : 0
-            let word = ["Weak", "Weak", "Fair", "Good"][Int(bars)]
-            out.append(Item(id: "rssi", text: "Wi-Fi \(word.lowercased())", symbol: "wifi",
-                            help: String(format: "Wi-Fi signal %.0f dBm", rssi), signal: bars / 3))
-        }
-        if let h = declared("RoomHumidity")?.doubleValue {
-            out.append(Item(id: "hum", text: String(format: "Humidity %.0f%%", h), symbol: "humidity"))
-        }
-        if let pm = declared("PM25Sensor")?.doubleValue, pm >= 0 {
-            let band = Self.pm25Band(Int(pm))
-            out.append(Item(id: "pm", text: String(format: "PM2.5 %.0f · %@", pm, band.label), symbol: "aqi.low",
-                            style: band.level >= 3 ? .warning : .plain, help: "Air quality: \(band.label)"))
-        }
-        if let w = declared("CurrentPowerConsumption")?.doubleValue {
-            out.append(Item(id: "power", text: String(format: "%.0f W", w), symbol: "bolt"))
-        }
-        let cleanFilter: Bool = {
-            switch raw["filterCleaningRequired"] {
-            case .bool(let b): return b
-            case .string(let s): return s.lowercased() == "true"
-            default: return false
-            }
+        let sleepId = device.activeSleepProfileId
+        let sleep = sleepId.flatMap { id in (ac.sleepProfiles[device.id] ?? []).first { ($0.isDefault ? "default" : $0.id) == id } }
+        let cleaning = device.isCleaning
+        let filter = device.filterNeedsCleaning
+        let errors = raw["errors"]?.stringValue?.trimmingCharacters(in: .whitespaces) ?? ""
+        let warnings = raw["warnings"]?.stringValue?.trimmingCharacters(in: .whitespaces) ?? ""
+        let pm: Int? = {
+            guard let cap = device.capability("PM25Sensor"), cap.key != cap.name,
+                  let v = raw[cap.key]?.doubleValue, v >= 0 else { return nil }
+            return Int(v)
         }()
-        if cleanFilter {
-            let cause = text("filterCleaningCause")
-            out.append(Item(id: "filter", text: "Clean filter", symbol: "line.3.horizontal.decrease", style: .warning,
-                            help: cause.isEmpty ? nil : cause))
+        let hasError = !errors.isEmpty && errors != "0"
+        let any = !timers.isEmpty || sleepId != nil || cleaning || filter || hasError || !warnings.isEmpty || pm != nil
+
+        if any {
+            FlowLayout(spacing: 6) {
+                ForEach(timers, id: \.0.rawValue) { slot, date in
+                    StatusChip(text: "\(slot == .off ? "Off" : "On") at \(date.formatted(date: .omitted, time: .shortened))",
+                               color: slot == .off ? .orange : .green, symbol: "timer",
+                               closeLabel: "Cancel \(slot == .off ? "turn-off" : "turn-on") timer") {
+                        ac.setTimer(device, slot, seconds: nil)
+                    }
+                }
+                if sleepId != nil {
+                    StatusChip(text: sleep?.displayName ?? "Sleep profile", color: .indigo, symbol: "moon.zzz.fill",
+                               help: "Sleep profile running", closeLabel: "Stop sleep profile",
+                               onClose: sleep.map { p in { ac.setSleepProfile(device, p, on: false) } })
+                }
+                if cleaning {
+                    StatusChip(text: "Cleaning", color: .teal, symbol: "sparkles", help: "Evaporator clean is running")
+                }
+                if filter {
+                    let cause = raw["filterCleaningCause"]?.stringValue ?? ""
+                    StatusChip(text: "Clean filter", color: .orange, symbol: "line.3.horizontal.decrease",
+                               help: cause.isEmpty ? "The filter needs cleaning" : cause)
+                }
+                if hasError {
+                    StatusChip(text: "Error \(errors)", color: .red, symbol: "exclamationmark.triangle.fill")
+                }
+                if !warnings.isEmpty {
+                    StatusChip(text: "Warning \(warnings)", color: .orange, symbol: "exclamationmark.circle.fill")
+                }
+                if let pm {
+                    let band = Self.pm25Band(pm)
+                    StatusChip(text: "PM2.5 \(pm) · \(band.label)",
+                               color: band.level <= 1 ? .green : band.level == 2 ? .yellow : band.level == 3 ? .orange : .red,
+                               symbol: band.level <= 1 ? "aqi.low" : band.level <= 3 ? "aqi.medium" : "aqi.high",
+                               help: "Air quality: \(band.label)")
+                }
+            }
         }
-        if let dust = raw["filterDustLevel"]?.intValue, dust > 0 {
-            out.append(Item(id: "dust", text: "Filter dust \(dust)", symbol: "line.3.horizontal.decrease"))
-        }
-        let warnings = text("warnings")
-        if !warnings.isEmpty {
-            out.append(Item(id: "warn", text: "Warning \(warnings)", symbol: "exclamationmark.circle.fill", style: .warning))
-        }
-        let errors = text("errors")
-        if !errors.isEmpty, errors != "0" {
-            out.append(Item(id: "error", text: "Error \(errors)", symbol: "exclamationmark.triangle.fill", style: .fault))
-        }
-        return out
     }
 
     /// `ACDevice.getAQIPM25Level` bands (µg/m³).
@@ -119,53 +114,107 @@ struct ACInfoRow: View {
         default: ("Hazardous", 5)
         }
     }
+}
+
+extension ACDevice {
+    var isCleaning: Bool {
+        guard let key = capability("EvaporatorClean")?.key else { return false }
+        return state.raw[key]?.stringValue?.lowercased() == "on"
+    }
+
+    var filterNeedsCleaning: Bool {
+        switch state.raw["filterCleaningRequired"] {
+        case .bool(let b): b
+        case .string(let s): s.lowercased() == "true"
+        default: false
+        }
+    }
+
+    /// Detail pages for this model, in action-bar order.
+    var actionPages: [ACPage] {
+        var out: [ACPage] = []
+        if timerRange != nil { out.append(.timer) }
+        if capability("SleepProfile") != nil { out.append(.sleep) }
+        out.append(.air)
+        if panels.contains(.energy) { out.append(.energy) }
+        out.append(.more)
+        return out
+    }
+}
+
+// MARK: Action bar
+
+/// Buttons that open the AC's detail pages. Circular icon wells (not option tiles) so they read as
+/// navigation; a dot marks pages with something active, a cloud glyph marks cloud-only pages.
+struct ACActionBar: View {
+    @EnvironmentObject private var ac: ACStore
+    @EnvironmentObject private var nav: Navigator
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    let device: ACDevice
+
+    private func active(_ p: ACPage) -> Bool {
+        switch p {
+        case .timer: ac.timerDate(device, .off) != nil || ac.timerDate(device, .on) != nil
+        case .sleep: device.activeSleepProfileId != nil
+        case .air: device.isCleaning
+        case .energy: false
+        case .more: device.filterNeedsCleaning
+        }
+    }
 
     var body: some View {
-        let items = items
-        if !items.isEmpty {
-            FlowLayout(spacing: 6) {
-                ForEach(items) { item in
-                    Group {
-                        switch item.style {
-                        case .fault: StatusPill(text: item.text, color: .red, symbol: item.symbol)
-                        case .warning: StatusPill(text: item.text, color: .orange, symbol: item.symbol)
-                        case .plain:
-                            Label {
-                                Text(item.text)
-                            } icon: {
-                                if let signal = item.signal {
-                                    Image(systemName: item.symbol, variableValue: signal)
-                                } else {
-                                    Image(systemName: item.symbol)
+        // Fixed five columns so buttons keep their positions across cards with fewer pages.
+        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 4), count: 5), spacing: 4) {
+            ForEach(device.actionPages) { p in
+                let on = active(p)
+                Button { nav.push(.ac(device.id, p)) } label: {
+                    VStack(spacing: 4) {
+                        Image(systemName: p.symbol)
+                            .font(.system(size: 14, weight: .medium))
+                            .frame(width: 34, height: 34)
+                            .background(Circle().fill(Color.primary.opacity(0.07)))
+                            .overlay(alignment: .topTrailing) {
+                                if on {
+                                    Circle()
+                                        .fill(Color.accentColor)
+                                        .frame(width: 8, height: 8)
+                                        .transition(reduceMotion ? .opacity : .scale(scale: 0.25).combined(with: .opacity))
                                 }
                             }
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .monospacedDigit()
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 3)
-                            .background(Capsule().fill(Color.primary.opacity(0.06)))
-                        }
+                            .overlay(alignment: .bottomTrailing) {
+                                if p.cloud {
+                                    Image(systemName: "cloud.fill")
+                                        .font(.system(size: 7, weight: .semibold))
+                                        .foregroundStyle(.secondary)
+                                        .offset(x: 2, y: 1)
+                                }
+                            }
+                            .animation(.timingCurve(0.2, 0, 0, 1, duration: 0.3), value: on)
+                        Text(p.title)
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                     }
-                    .help(item.help ?? item.text)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 2)
+                    .contentShape(Rectangle())
                 }
+                .buttonStyle(.pressable)
+                .help(p.cloud ? "\(p.title) (uses MirAIe cloud)" : p.title)
+                .accessibilityLabel(p.title + (on ? ", active" : ""))
             }
         }
     }
 }
 
-// MARK: Timer
+// MARK: Timer page
 
-/// Turn-on / turn-off timer with presets, a custom stepper and active-timer pills. Both slots can be set;
-/// the picker defaults to "Turn off" while the AC runs and "Turn on" while it's off.
-struct ACTimerRow: View {
+/// Turn-on / turn-off timer. Both slots can be set; the selector defaults to "Turn off" while the AC runs.
+struct ACTimerPage: View {
     @EnvironmentObject private var ac: ACStore
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let device: ACDevice
 
-    @ViewState private var customOpen = false
     @ViewState private var customMinutes = 90
-    /// User's choice; nil follows the power state.
     @ViewState private var chosenSlot: ACStore.TimerSlot?
 
     private var slot: ACStore.TimerSlot { chosenSlot ?? (device.state.power ? .off : .on) }
@@ -173,75 +222,60 @@ struct ACTimerRow: View {
     private var presets: [Int] { [30, 60, 120, 240, 480].filter { Double($0) >= range.min && Double($0) <= range.max } }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
-                Image(systemName: "timer").font(.caption).foregroundStyle(.secondary).frame(width: 16)
-                    .accessibilityHidden(true)
+        let active: [(ACStore.TimerSlot, Date)] = [ACStore.TimerSlot.off, .on].compactMap { s in
+            ac.timerDate(device, s).map { (s, $0) }
+        }
+        VStack(spacing: Metrics.sectionSpacing) {
+            PageSection("New timer") {
                 Picker("Timer type", selection: Binding(get: { slot }, set: { chosenSlot = $0 })) {
                     Text("Turn on").tag(ACStore.TimerSlot.on)
                     Text("Turn off").tag(ACStore.TimerSlot.off)
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
-                .controlSize(.small)
-                .fixedSize()
-                Text("in").font(.caption).foregroundStyle(.secondary)
-                Spacer()
-                Menu {
+                Text(slot == .off ? "Turn the AC off in" : "Turn the AC on in")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 4), count: 3), spacing: 4) {
                     ForEach(presets, id: \.self) { m in
-                        Button(Self.duration(m)) { ac.setTimer(device, slot, seconds: m * 60) }
+                        TileButton(title: Self.duration(m)) { ac.setTimer(device, slot, seconds: m * 60) }
                     }
-                    Divider()
-                    Button("Custom…") {
-                        customMinutes = Int(min(range.max, max(range.min, 90)))
-                        customOpen = true
-                    }
-                } label: {
-                    Text("Set timer").font(.caption.weight(.medium))
                 }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
-                .accessibilityLabel(slot == .off ? "Set turn-off timer" : "Set turn-on timer")
-            }
-
-            if customOpen {
                 HStack(spacing: 8) {
                     Stepper(value: $customMinutes, in: Int(range.min)...Int(range.max), step: Int(range.step)) {
-                        Text(Self.duration(customMinutes)).font(.caption).monospacedDigit()
+                        Text(Self.duration(customMinutes)).font(.callout).monospacedDigit()
                     }
                     Spacer()
-                    Button("Cancel") { customOpen = false }.buttonStyle(.borderless).font(.caption)
-                    Button("Set") {
-                        ac.setTimer(device, slot, seconds: customMinutes * 60)
-                        customOpen = false
-                    }
-                    .font(.caption.weight(.semibold))
+                    Button("Set Timer") { ac.setTimer(device, slot, seconds: customMinutes * 60) }
+                        .controlSize(.small)
                 }
-                .padding(.leading, 24)
-                .transition(.reveal(reduceMotion: reduceMotion))
             }
 
-            let active: [(ACStore.TimerSlot, Date)] = [ACStore.TimerSlot.off, .on].compactMap { s in
-                ac.timerDate(device, s).map { (s, $0) }
-            }
-            if !active.isEmpty {
-                FlowLayout(spacing: 6) {
-                    ForEach(active, id: \.0.rawValue) { s, date in
-                        HStack(spacing: 4) {
-                            StatusPill(text: "\(s == .off ? "Off" : "On") at \(date.formatted(date: .omitted, time: .shortened))",
-                                       color: s == .off ? .orange : .green, symbol: "timer")
-                            Button { ac.setTimer(device, s, seconds: nil) } label: {
-                                Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
-                            }
-                            .buttonStyle(.pressable)
-                            .help("Cancel timer")
-                            .accessibilityLabel("Cancel \(s == .off ? "turn-off" : "turn-on") timer")
+            PageSection("Active") {
+                if active.isEmpty {
+                    Text("No timers set.").font(.caption).foregroundStyle(.secondary)
+                }
+                ForEach(active, id: \.0.rawValue) { s, date in
+                    HStack(spacing: 10) {
+                        Image(systemName: "timer")
+                            .font(.system(size: 13))
+                            .foregroundStyle(s == .off ? Color.orange : Color.green)
+                            .frame(width: 18)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("Turns \(s == .off ? "off" : "on") at \(date.formatted(date: .omitted, time: .shortened))")
+                                .font(.callout)
+                            Text("in " + Self.duration(max(1, Int(date.timeIntervalSinceNow / 60))))
+                                .font(.caption).foregroundStyle(.secondary).monospacedDigit()
                         }
+                        Spacer()
+                        Button("Cancel") { ac.setTimer(device, s, seconds: nil) }
+                            .controlSize(.small)
+                            .accessibilityLabel("Cancel \(s == .off ? "turn-off" : "turn-on") timer")
                     }
                 }
-                .padding(.leading, 24)
             }
         }
+        .onAppear { customMinutes = Int(min(range.max, max(range.min, 90))) }
     }
 
     static func duration(_ minutes: Int) -> String {
@@ -254,6 +288,25 @@ struct ACTimerRow: View {
     }
 }
 
+/// Neutral action tile (timer presets). Actions, not selections, so no selected state;
+/// primary text on a neutral fill keeps contrast in both themes.
+struct TileButton: View {
+    let title: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Text(title)
+                .font(.callout.weight(.medium))
+                .monospacedDigit()
+                .foregroundStyle(.primary)
+                .frame(maxWidth: .infinity, minHeight: 32)
+                .background(RoundedRectangle(cornerRadius: Metrics.tileRadius, style: .continuous).fill(Color.primary.opacity(0.08)))
+        }
+        .buttonStyle(.pressable)
+    }
+}
+
 // MARK: Profiles
 
 /// Saved local profiles as chips: click to apply, right-click to delete.
@@ -263,7 +316,7 @@ struct ACProfilesRow: View {
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Image(systemName: "square.stack").font(.caption).foregroundStyle(.secondary).frame(width: 16)
+            Image(systemName: "bookmark").font(.caption).foregroundStyle(.secondary).frame(width: 16)
                 .accessibilityHidden(true)
             FlowLayout(spacing: 6) {
                 ForEach(ac.profiles[device.id] ?? []) { p in
@@ -292,90 +345,68 @@ struct ACProfilesRow: View {
     }
 }
 
-// MARK: More controls
+// MARK: Air page
 
-/// Model-driven extra controls. Only capabilities the AC's model declares are shown.
-struct ACMoreControls: View {
+/// Model-driven air controls in grouped sections: air flow, display, capacity, features.
+struct ACAirPage: View {
     @EnvironmentObject private var ac: ACStore
     let device: ACDevice
-    let tint: Color
 
-    private var caps: [ACCapability] { device.capabilities }
+    private var tint: Color { ACModeStyle.tint(device.state.mode) }
     private var muted: Bool { !device.state.power }
 
     var body: some View {
-        let caps = caps
+        let caps = device.capabilities
         let toggles = ACCapability.toggleNames.compactMap { n in caps.first { $0.name == n && $0.kind == .toggle } }
         let cycles = caps.filter { if case .cycle = $0.kind { return true } else { return false } }
         let choiceCaps = caps.filter { if case .choice = $0.kind { return true } else { return false } }
-        let intCaps = ["VerticalSwing", "HorizontalSwing", "Convertible", "ACGenMode"].compactMap { n in
-            caps.first { $0.name == n }
-        }
+        let swings = ["VerticalSwing", "HorizontalSwing"].compactMap { n in caps.first { $0.name == n } }
+        let capacity = ["Convertible", "ACGenMode"].compactMap { n in caps.first { $0.name == n } }
+        let cleaning = device.isCleaning
 
-        let cleanKey = device.capability("EvaporatorClean")?.key
-        let cleaning = cleanKey.map { device.state.raw[$0]?.stringValue?.lowercased() == "on" } ?? false
-
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(spacing: Metrics.sectionSpacing) {
             if caps.isEmpty {
-                Text("Extra controls appear after the AC's model info loads (Refresh while signed in).")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                PageSection(nil) {
+                    Label("Extra controls appear after the AC's model info loads (Refresh while signed in).", systemImage: "info.circle")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
 
             if !toggles.isEmpty || !cycles.isEmpty {
-                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 4), count: 4), spacing: 4) {
-                    ForEach(toggles) { cap in
-                        let on = device.isOn(cap)
-                        OptionTile(title: cap.label, symbol: cap.symbol, selected: on, tint: tint, muted: muted) {
-                            ac.setToggle(device, cap, !on)
-                        }
-                        .help("\(cap.label): \(on ? "on" : "off")")
-                    }
-                    ForEach(cycles) { cap in
-                        if case .cycle(let values) = cap.kind {
-                            let value = device.state.raw[cap.key]?.stringValue?.lowercased() ?? "off"
-                            let next = values[((values.firstIndex(of: value) ?? -1) + 1) % values.count]
-                            OptionTile(title: value == "off" ? cap.label : "\(cap.label) \(value)", symbol: cap.symbol,
-                                       selected: value != "off", tint: tint, muted: muted) {
-                                // Official app: SingleValueCapability.buildMessage(json, str) sends no `ki`.
-                                ac.sendFields(device, [cap.key: next], ki: -1)
-                                ac.update(device) { $0.raw[cap.key] = .string(next) }
+                PageSection("Features") {
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 4), count: 3), spacing: 4) {
+                        ForEach(toggles) { cap in
+                            let on = device.isOn(cap)
+                            OptionTile(title: cap.label, symbol: cap.symbol, selected: on, tint: tint, muted: muted) {
+                                ac.setToggle(device, cap, !on)
                             }
-                            .help("\(cap.label): \(value) — click for \(next)")
+                            .help("\(cap.label): \(on ? "on" : "off")")
                         }
-                    }
-                }
-            }
-
-            ForEach(choiceCaps) { cap in
-                if case .choice(let values) = cap.kind {
-                    LabeledChips(title: cap.label) {
-                        ForEach(values, id: \.self) { v in
-                            OptionTile(title: v.capitalized, symbol: "", selected: device.state.raw[cap.key]?.stringValue == v,
-                                       tint: tint, compact: true, muted: muted) {
-                                ac.send(device, capability: cap, value: v)
+                        ForEach(cycles) { cap in
+                            if case .cycle(let values) = cap.kind {
+                                let value = device.state.raw[cap.key]?.stringValue?.lowercased() ?? "off"
+                                let next = values[((values.firstIndex(of: value) ?? -1) + 1) % values.count]
+                                OptionTile(title: value == "off" ? cap.label : "\(cap.label) \(value)", symbol: cap.symbol,
+                                           selected: value != "off", tint: tint, muted: muted) {
+                                    // Official app: SingleValueCapability.buildMessage(json, str) sends no `ki`.
+                                    ac.sendFields(device, [cap.key: next], ki: -1)
+                                    ac.update(device) { $0.raw[cap.key] = .string(next) }
+                                }
+                                .help("\(cap.label): \(value) — click for \(next)")
                             }
                         }
                     }
                 }
             }
 
-            ForEach(intCaps) { cap in
-                if case .intChoice(let options) = cap.kind, !options.isEmpty {
-                    let isSwing = cap.name.hasSuffix("Swing")
-                    let lastSwing = intCaps.last(where: { $0.name.hasSuffix("Swing") })?.name == cap.name
-                    LabeledChips(title: cap.label) {
-                        ForEach(options, id: \.self) { opt in
-                            OptionTile(title: opt.label, symbol: "", selected: device.state.raw[cap.key]?.intValue == opt.value,
-                                       tint: tint, compact: true, muted: muted) {
-                                ac.send(device, capability: cap, value: opt.value)
-                            }
-                        }
-                    }
-                    .disabled(isSwing && cleaning)
-                    .opacity(isSwing && cleaning ? 0.5 : 1)
-                    if lastSwing && cleaning {
+            if !swings.isEmpty {
+                PageSection("Air flow") {
+                    ForEach(swings) { cap in intChips(cap) }
+                        .disabled(cleaning)
+                        .opacity(cleaning ? 0.5 : 1)
+                    if cleaning {
                         Label("Swing is locked while Clean runs", systemImage: "lock.fill")
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -383,13 +414,48 @@ struct ACMoreControls: View {
                 }
             }
 
-            SaveProfileRow(device: device)
+            if !choiceCaps.isEmpty {
+                PageSection("Display") {
+                    ForEach(choiceCaps) { cap in
+                        if case .choice(let values) = cap.kind {
+                            LabeledChips(title: choiceCaps.count > 1 ? cap.label : nil) {
+                                ForEach(values, id: \.self) { v in
+                                    OptionTile(title: v.capitalized, symbol: "", selected: device.state.raw[cap.key]?.stringValue == v,
+                                               tint: tint, compact: true, muted: muted) {
+                                        ac.send(device, capability: cap, value: v)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !capacity.isEmpty {
+                PageSection("Capacity") {
+                    ForEach(capacity) { cap in intChips(cap, showTitle: capacity.count > 1) }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func intChips(_ cap: ACCapability, showTitle: Bool = true) -> some View {
+        if case .intChoice(let options) = cap.kind, !options.isEmpty {
+            LabeledChips(title: showTitle ? cap.label : nil) {
+                ForEach(options, id: \.self) { opt in
+                    OptionTile(title: opt.label, symbol: "", selected: device.state.raw[cap.key]?.intValue == opt.value,
+                               tint: tint, compact: true, muted: muted) {
+                        ac.send(device, capability: cap, value: opt.value)
+                    }
+                }
+            }
         }
     }
 }
 
 /// "Save current settings as profile…" with an inline name field.
-private struct SaveProfileRow: View {
+struct SaveProfileRow: View {
     @EnvironmentObject private var ac: ACStore
     let device: ACDevice
     @ViewState private var editing = false
@@ -425,18 +491,18 @@ private struct SaveProfileRow: View {
 
 /// Caption above a row of equal-width chips that wraps into a grid past six options.
 private struct LabeledChips<Content: View>: View {
-    let title: String
+    let title: String?
     @ViewBuilder let content: () -> Content
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+            if let title { Text(title).font(.caption).foregroundStyle(.secondary) }
             LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 4), count: 6), spacing: 4) {
                 content()
             }
         }
         .accessibilityElement(children: .contain)
-        .accessibilityLabel(title)
+        .accessibilityLabel(title ?? "")
     }
 }
 
@@ -446,14 +512,17 @@ private struct LabeledChips<Content: View>: View {
 struct ACDiagnosticsCard: View {
     @EnvironmentObject private var ac: ACStore
     @ViewState private var copied = false
-    let close: () -> Void
+    /// Shown with a Hide button when embedded; nil on its own page.
+    var close: (() -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Label("AC Diagnostics", systemImage: "stethoscope").font(.subheadline.weight(.semibold))
-                Spacer()
-                Button("Hide", action: close).buttonStyle(.borderless).font(.caption)
+            if let close {
+                HStack {
+                    Label("AC Diagnostics", systemImage: "stethoscope").font(.subheadline.weight(.semibold))
+                    Spacer()
+                    Button("Hide", action: close).buttonStyle(.borderless).font(.caption)
+                }
             }
             Text("Safe to share: no password, no tokens, and LAN keys are masked.")
                 .font(.caption)

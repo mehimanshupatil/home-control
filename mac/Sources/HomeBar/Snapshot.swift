@@ -29,7 +29,6 @@ enum Snapshot {
         if ProcessInfo.processInfo.environment["HOMEBAR_KEYTEST"] != nil { keyRoundTrip() }
         guard let dir = ProcessInfo.processInfo.environment["HOMEBAR_SNAPSHOT"] else { return }
         _ = NSApplication.shared
-        BulbCard.debugExpandFirst = true
         for (tab, tabName) in [(0, "climate"), (1, "lights")] {
             for (appearance, mode) in [(NSAppearance.Name.aqua, "light"), (.darkAqua, "dark")] {
                 UserDefaults.standard.set(tab, forKey: "selectedTab")
@@ -37,9 +36,11 @@ enum Snapshot {
                 let lights = LightsStore()
                 RunLoop.main.run(until: Date().addingTimeInterval(0.3)) // let startup tasks settle
                 ac.seedDemo(); lights.seedDemo()
+                ac.devices[0].state.raw["acsp"] = .string("p1") // sleep running on the first AC
                 let root = ContentView()
                     .environmentObject(ac)
                     .environmentObject(lights)
+                    .environmentObject(Navigator())
                     .background(.windowBackground)
                 let host = NSHostingView(rootView: root)
                 host.appearance = NSAppearance(named: appearance)
@@ -64,8 +65,37 @@ enum Snapshot {
     /// Renders any view at panel width to `<dir>/<name>-<light|dark>.png`.
     private static func render<V: View>(_ view: V, name: String, dir: String, ac: ACStore, lights: LightsStore) {
         for (appearance, mode) in [(NSAppearance.Name.aqua, "light"), (.darkAqua, "dark")] {
-            let root = view.environmentObject(ac).environmentObject(lights)
+            let root = view.environmentObject(ac).environmentObject(lights).environmentObject(Navigator())
                 .padding(16).frame(width: 380).background(.windowBackground)
+            let host = NSHostingView(rootView: root)
+            host.appearance = NSAppearance(named: appearance)
+            host.frame = NSRect(origin: .zero, size: host.fittingSize)
+            let window = NSWindow(contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+            window.appearance = NSAppearance(named: appearance)
+            window.contentView = host
+            host.layoutSubtreeIfNeeded()
+            RunLoop.main.run(until: Date().addingTimeInterval(0.4)) // let `.task` loaders finish
+            host.frame = NSRect(origin: .zero, size: host.fittingSize)
+            window.setContentSize(host.frame.size)
+            host.layoutSubtreeIfNeeded()
+            guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { continue }
+            host.cacheDisplay(in: host.bounds, to: rep)
+            let url = URL(fileURLWithPath: dir).appendingPathComponent("\(name)-\(mode).png")
+            try? rep.representation(using: .png, properties: [:])?.write(to: url)
+            print("wrote", url.path)
+        }
+    }
+
+    /// Renders the whole panel (header, tabs or a pushed page) at full content height.
+    private static func renderPanel(_ route: Route?, tab: HomeTab, name: String, dir: String,
+                                    ac: ACStore, lights: LightsStore, unbounded: Bool = true) {
+        UserDefaults.standard.set(tab.rawValue, forKey: "selectedTab")
+        ContentView.debugUnbounded = unbounded
+        defer { ContentView.debugUnbounded = false }
+        for (appearance, mode) in [(NSAppearance.Name.aqua, "light"), (.darkAqua, "dark")] {
+            let root = ContentView()
+                .environmentObject(ac).environmentObject(lights).environmentObject(Navigator(route: route))
+                .background(.windowBackground)
             let host = NSHostingView(rootView: root)
             host.appearance = NSAppearance(named: appearance)
             host.frame = NSRect(origin: .zero, size: host.fittingSize)
@@ -92,30 +122,40 @@ enum Snapshot {
         ac.seedDemo(); lights.seedDemo()
         Keychain.save(LocalACInfo(mac: "AA:BB:CC:DD:EE:FF", ip: "192.168.1.50", key: demoKey, iv: demoIV), account: "local-d1")
         defer { Keychain.delete(account: "local-d1") }
-        ACCard.debugExpandMore = true
-        BulbCard.debugExpandFirst = true
-        render(ACCard(device: ac.devices[0]), name: "ac-more", dir: dir, ac: ac, lights: lights)
-        render(ACCard(device: ac.devices[1]), name: "ac-more-off-unknown", dir: dir, ac: ac, lights: lights)
+        ac.devices[0].state.raw["acsp"] = .string("p1") // sleep profile running on the first AC
+
+        renderPanel(nil, tab: .climate, name: "climate-full", dir: dir, ac: ac, lights: lights)
+        render(ACCard(device: ac.devices[1]), name: "ac-off", dir: dir, ac: ac, lights: lights)
+        for page in ACPage.allCases {
+            renderPanel(.ac("d1", page), tab: .climate, name: "page-\(page.rawValue)", dir: dir, ac: ac, lights: lights)
+        }
+        renderPanel(.ac("d3", .air), tab: .climate, name: "page-air-rich", dir: dir, ac: ac, lights: lights)
+        renderPanel(.ac("d3", .more), tab: .climate, name: "page-more-rich", dir: dir, ac: ac, lights: lights)
+        renderPanel(.ac("d2", .air), tab: .climate, name: "page-air-unknown", dir: dir, ac: ac, lights: lights)
+        if let night = ac.sleepProfiles["d1"]?.last {
+            ACSleepPanel.debugEditing = night
+            renderPanel(.ac("d1", .sleep), tab: .climate, name: "page-sleep-editor", dir: dir, ac: ac, lights: lights)
+            ACSleepPanel.debugEditing = nil
+        }
         if let clean = ac.devices[0].capability("EvaporatorClean") {
             ac.send(ac.devices[0], capability: clean, value: "on")
-            render(ACCard(device: ac.devices[0]), name: "ac-clean", dir: dir, ac: ac, lights: lights)
+            renderPanel(.ac("d1", .air), tab: .climate, name: "page-air-clean", dir: dir, ac: ac, lights: lights)
+            renderPanel(nil, tab: .climate, name: "climate-cleaning", dir: dir, ac: ac, lights: lights)
+            ac.send(ac.devices[0], capability: clean, value: "off")
         }
-        render(ACDiagnosticsCard {}, name: "diagnostics", dir: dir, ac: ac, lights: lights)
-        ACCard.debugExpandMore = false
-        for panel in ACPanel.allCases {
-            ACCard.debugPanel = panel
-            render(ACCard(device: ac.devices[0]), name: "ac-panel-\(panel.rawValue)", dir: dir, ac: ac, lights: lights)
+        renderPanel(.notifications, tab: .climate, name: "page-notifications", dir: dir, ac: ac, lights: lights)
+        renderPanel(.diagnostics, tab: .climate, name: "page-diagnostics", dir: dir, ac: ac, lights: lights)
+        renderPanel(.keys, tab: .climate, name: "page-keys", dir: dir, ac: ac, lights: lights)
+        renderPanel(nil, tab: .lights, name: "lights-full", dir: dir, ac: ac, lights: lights)
+        renderPanel(.rooms, tab: .lights, name: "page-rooms", dir: dir, ac: ac, lights: lights)
+        renderPanel(.bulb(lights.bulbs[0].id), tab: .lights, name: "page-bulb", dir: dir, ac: ac, lights: lights)
+        if let moving = lights.bulbs.first(where: { LightsStore.movingScenes.contains($0.sceneId) }) {
+            renderPanel(.bulb(moving.id), tab: .lights, name: "page-bulb-scene", dir: dir, ac: ac, lights: lights)
         }
-        ACCard.debugPanel = .filter
-        render(ACCard(device: ac.devices[2]), name: "ac-panel-filter-dust", dir: dir, ac: ac, lights: lights)
-        ACCard.debugPanel = nil
-        ACCard.debugExpandMore = true
-        render(ACCard(device: ac.devices[2]), name: "ac-rich", dir: dir, ac: ac, lights: lights)
-        ACCard.debugExpandMore = false
-        render(ACNotificationsCard {}, name: "notifications", dir: dir, ac: ac, lights: lights)
-        BulbCard.debugExpandFirst = false
-        render(LightsSection(), name: "lights-rooms", dir: dir, ac: ac, lights: lights)
-        render(BulbCard(bulb: lights.bulbs[0]), name: "bulb-scene", dir: dir, ac: ac, lights: lights)
+        // README screenshots: real panel size.
+        renderPanel(nil, tab: .climate, name: "readme-climate", dir: dir, ac: ac, lights: lights, unbounded: false)
+        renderPanel(nil, tab: .lights, name: "readme-lights", dir: dir, ac: ac, lights: lights, unbounded: false)
+        renderPanel(.ac("d1", .air), tab: .climate, name: "readme-air", dir: dir, ac: ac, lights: lights, unbounded: false)
     }
 
     static let demoKey = "00112233445566778899aabbccddeeff"
@@ -277,7 +317,7 @@ enum Snapshot {
                                   key: "00112233445566778899aabbccddeeff", iv: "0f0e0d0c0b0a09080706050403020100"),
                       account: "local-d1")
         defer { Keychain.delete(account: "local-d1") }
-        let root = ACKeysCard {}.environmentObject(ac).padding(16).frame(width: 380).background(.windowBackground)
+        let root = ACKeysCard().environmentObject(ac).padding(16).frame(width: 380).background(.windowBackground)
         let host = NSHostingView(rootView: root)
         host.appearance = NSAppearance(named: .aqua)
         host.frame = NSRect(origin: .zero, size: host.fittingSize)
