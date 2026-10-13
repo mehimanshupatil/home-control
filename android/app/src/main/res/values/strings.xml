@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Home Control</string>
+    <string name="tile_ac">AC</string>
+</resources>

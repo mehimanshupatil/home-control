@@ -1,0 +1,32 @@
+# Third-party app packages and decompiled output — never commit (copyrighted, large)
+*.apk
+*.apks
+*.xapk
+*.aab
+extracted/
+
+# macOS
+.DS_Store
+
+# Mac app (SwiftPM)
+mac/.build/
+mac/HomeBar.app/
+mac/.swiftpm/
+
+# Android
+android/.gradle/
+android/.kotlin/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+*.iml
+captures/
+
+# Editors
+.vscode/
+.idea/
+
+# Local scratch / diagnostics that may contain device data
+*.log
+diagnostics*.json
